@@ -178,16 +178,10 @@ async def model_name_manager():
                 # Wait 2 seconds before retry
                 await asyncio.sleep(2)
         else:
-            # Model name is set - sleep longer, just monitor
-            # We'll be woken up if there's an error
             await asyncio.sleep(10)
 
 
 def trigger_model_refresh():
-    """
-    Trigger model name refresh by clearing current name.
-    The background task will automatically start pinging again.
-    """
     global current_model_name
     if current_model_name:
         logger.warning(f"Clearing model name '{current_model_name}' and triggering refresh")
@@ -195,22 +189,10 @@ def trigger_model_refresh():
 
 
 def get_model_name() -> str:
-    """
-    Get the current model name, or a placeholder if not available yet.
-
-    Returns:
-        str: The current model name, or "unknown-model" as fallback
-    """
     return current_model_name or "unknown-model"
 
 
 def is_model_available() -> bool:
-    """
-    Check if the model is currently available.
-
-    Returns:
-        bool: True if model name is set, False otherwise
-    """
     return current_model_name is not None
 
 
