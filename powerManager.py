@@ -249,7 +249,7 @@ class PowerManager:
 
 
 # Global singleton instance
-power_manager = PowerManager(idle_timeout_seconds=120)  # 2 minutes
+power_manager = PowerManager(idle_timeout_seconds=300)  # 5 minutes
 
 
 if __name__ == "__main__":

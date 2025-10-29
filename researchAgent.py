@@ -9,8 +9,8 @@ import re
 # Load configuration from environment variables
 from config import config, logger
 
-# Initialize vLLM client with config
-vllm = OpenAI(base_url=config.VLLM_BASE_URL, api_key="dummy")
+# Initialize research model client with config
+vllm = OpenAI(base_url=config.RESEARCH_MODEL_URL, api_key="dummy")
 
 TOOL_SYSTEM_PROMPT = """You have access to research tools to gather comprehensive information. Available tools:
 

@@ -129,6 +129,8 @@ async def fetch_model_name() -> Optional[str]:
                     return model_name
 
             logger.warning(f"Models endpoint returned unexpected format: {data}")
+            # Clear cached data since response is invalid
+            current_model_data = None
             return None
     except (httpx.TimeoutException, httpx.ReadTimeout) as e:
         # Timeout occurred - check if vLLM container is running
@@ -145,9 +147,13 @@ async def fetch_model_name() -> Optional[str]:
             return None
         else:
             logger.error("No vLLM container found running")
+            # Clear cached data since vLLM is not running
+            current_model_data = None
             return None
     except Exception as e:
         logger.error(f"Failed to fetch model name: {str(e)}")
+        # Clear cached data on error
+        current_model_data = None
         return None
 
 
@@ -157,11 +163,11 @@ async def model_name_manager():
 
     Logic:
     - On startup: Ping /v1/models every 2 seconds until successful
-    - Once fetched: Stop pinging (save resources)
+    - Once fetched: Verify every 30 seconds that vLLM is still available
     - On vLLM error: Clear model name and resume pinging
     - Resilient to Docker container restarts
     """
-    global current_model_name
+    global current_model_name, current_model_data
 
     logger.info("Starting model name manager...")
 
@@ -178,14 +184,24 @@ async def model_name_manager():
                 # Wait 2 seconds before retry
                 await asyncio.sleep(2)
         else:
-            await asyncio.sleep(10)
+            # Model is set - verify it's still available every 30 seconds
+            await asyncio.sleep(30)
+
+            # Quick health check: verify vLLM container is still running
+            is_running = await check_vllm_container_running()
+
+            if not is_running:
+                logger.warning(f"vLLM container no longer running, clearing model state")
+                current_model_name = None
+                current_model_data = None
 
 
 def trigger_model_refresh():
-    global current_model_name
+    global current_model_name, current_model_data
     if current_model_name:
         logger.warning(f"Clearing model name '{current_model_name}' and triggering refresh")
         current_model_name = None
+        current_model_data = None
 
 
 def get_model_name() -> str:
@@ -323,15 +339,15 @@ async def lifespan(app: FastAPI):
     logger.info("Model name manager started")
 
     # Start power manager
-    # await power_manager.start()
-    # logger.info("Power manager started")
+    await power_manager.start()
+    logger.info("Power manager started")
 
     yield
 
     # Cleanup on shutdown
     # Stop power manager first
-    # await power_manager.stop()
-    # logger.info("Power manager stopped")
+    await power_manager.stop()
+    logger.info("Power manager stopped")
 
     # Stop model name manager
     if model_fetch_task:
@@ -452,11 +468,15 @@ async def passthrough_stream(body: dict, request: Request = None):
     # Generate unique request ID for logging
     request_id = id(request) if request else "unknown"
 
+    # LOG FORWARDING DESTINATION
+    target_url = f"{config.VLLM_BACKEND_URL}/v1/chat/completions"
+    logger.debug(f"🟢 FORWARD (stream): → {target_url}")
+
     try:
         async with httpx.AsyncClient() as client:
             async with client.stream(
                 "POST",
-                f"{config.VLLM_BACKEND_URL}/v1/chat/completions",
+                target_url,
                 json=body,
                 timeout=300.0
             ) as response:
@@ -493,10 +513,14 @@ async def passthrough_sync(body: dict):
     Pure transparent pass-through for non-streaming.
     Client sees raw vLLM response as if proxy doesn't exist.
     """
+    # LOG FORWARDING DESTINATION
+    target_url = f"{config.VLLM_BACKEND_URL}/v1/chat/completions"
+    logger.debug(f"🟢 FORWARD (sync): → {target_url}")
+
     try:
         async with httpx.AsyncClient() as client:
             response = await client.post(
-                f"{config.VLLM_BACKEND_URL}/v1/chat/completions",
+                target_url,
                 json=body,
                 timeout=300.0
             )
@@ -631,9 +655,29 @@ async def autonomous_chat(request: Request):
     Used by:
         - External clients as OpenAI-compatible API endpoint
     """
+    # LOG INCOMING REQUEST DETAILS
+    client_ip = request.client.host if request.client else "unknown"
+    logger.debug(f"🔵 ROUTE: /v1/chat/completions | FROM: {client_ip} | HANDLER: autonomous_chat")
+
     body = await request.json()
     messages = body.get("messages", [])
     stream = body.get("stream", False)
+
+    # Log first 20 words of last user message
+    if messages:
+        last_msg = messages[-1].get("content", "")
+        if isinstance(last_msg, str):
+            words = last_msg.split()[:20]
+            preview = " ".join(words) + ("..." if len(last_msg.split()) > 20 else "")
+            logger.debug(f"📝 REQUEST PREVIEW: {preview}")
+
+    # Add connection tracking EARLY (before any early returns)
+    # This ensures even multimodal requests trigger power management
+    path = request.url.path
+    connection_id = ""
+    if path not in connection_manager.excluded_endpoints:
+        connection_id = await connection_manager.add_connection(request, path)
+        logger.debug(f"Connection tracking started: {connection_id} for {path}")
 
     # Check if model is available, wait up to 30 seconds if not
     if not is_model_available():
@@ -653,38 +697,31 @@ async def autonomous_chat(request: Request):
         else:
             logger.info("Model became available, proceeding with request")
 
-    # Check for multimodal content first - always passthrough if present
-    if is_multimodal(messages):
-        logger.debug("Multimodal content detected - passing through to vLLM")
-        if stream:
-            return StreamingResponse(
-                passthrough_stream(body, request),
-                media_type="text/event-stream"
-            )
-        else:
-            return await passthrough_sync(body)
-
-    # Detect research mode and iteration count
-    is_research, iterations = detect_research_mode(messages)
-
-    # Debug logging
-    logger.info(f"Request received. Research mode: {is_research}, Iterations: {iterations}")
-
-    # Extract Authorization header and log first 6 characters of bearer token
-    auth_header = request.headers.get("Authorization")
-    if auth_header and auth_header.startswith("Bearer "):
-        token = auth_header[7:]  # Remove "Bearer " prefix
-        masked_token = token[:6] + "..."
-        logger.info(f"Bearer token received: {masked_token}")
-
-    # Add connection tracking (excluding excluded endpoints)
-    path = request.url.path
-    connection_id = ""
-    if path not in connection_manager.excluded_endpoints:
-        connection_id = await connection_manager.add_connection(request, path)
-        logger.debug(f"Connection tracking started: {connection_id} for {path}")
-
     try:
+        # Check for multimodal content first - always passthrough if present
+        if is_multimodal(messages):
+            logger.debug("🖼️  Multimodal content detected - passing through to vLLM")
+            if stream:
+                return StreamingResponse(
+                    passthrough_stream(body, request),
+                    media_type="text/event-stream"
+                )
+            else:
+                return await passthrough_sync(body)
+
+        # Detect research mode and iteration count
+        is_research, iterations = detect_research_mode(messages)
+
+        # Debug logging
+        logger.info(f"Request received. Research mode: {is_research}, Iterations: {iterations}")
+
+        # Extract Authorization header and log first 6 characters of bearer token
+        auth_header = request.headers.get("Authorization")
+        if auth_header and auth_header.startswith("Bearer "):
+            token = auth_header[7:]  # Remove "Bearer " prefix
+            masked_token = token[:6] + "..."
+            logger.info(f"Bearer token received: {masked_token}")
+
         if is_research:
             # Get current model name for research mode
             model = get_model_name()
@@ -812,7 +849,7 @@ async def health():
         "model_loaded": is_model_available(),
         "model_name": current_model_name
     }
-    vllm_container = check_container("robai-qwen3")  # Updated container name
+    vllm_container = check_container("vllm-qwen3")  # Updated container name
     vllm_status.update(vllm_container)
     health_status["services"]["vllm-qwen3"] = vllm_status
 
@@ -856,12 +893,15 @@ async def health():
 
 
 @app.get("/v1/models")
+@app.get("/models")
 async def list_models():
     """
     Return available models using cached model data from proxy.
 
     Returns cached full model response from vLLM /v1/models endpoint.
     If model not yet loaded, returns empty list.
+
+    Available at both /v1/models and /models for compatibility.
     """
     # If model data is cached, return it directly
     if current_model_data:
@@ -900,20 +940,25 @@ async def catch_all_proxy(request: Request, path: str):
 
     Already-handled endpoints (health, v1/chat/completions, v1/models) are skipped.
     """
+    # LOG INCOMING REQUEST TO CATCH-ALL
+    client_ip = request.client.host if request.client else "unknown"
+    logger.debug(f"🔴 ROUTE: /{path} | FROM: {client_ip} | HANDLER: catch_all_proxy | METHOD: {request.method}")
+
     # Skip endpoints we've already defined - these are handled by their specific routes
-    if path in ["health", "v1/chat/completions", "v1/models", "openapi.json"]:
+    if path in ["health", "v1/chat/completions", "v1/models", "models", "openapi.json"]:
         # Return 404 since these should have been caught by their specific handlers
+        logger.warning(f"⚠️  Catch-all matched reserved endpoint: {path} - this should not happen!")
         raise HTTPException(status_code=404, detail="Route handled by specific endpoint")
 
     # Route based on endpoint type
     if is_vllm_endpoint(path):
         # vLLM endpoint - forward to vLLM backend
         target_url = f"{config.VLLM_BACKEND_URL}/{path}"
-        logger.debug(f"Routing vLLM endpoint {path} to {target_url}")
+        logger.debug(f"🟡 FORWARD (vLLM): → {target_url}")
     else:
         # Non-vLLM endpoint - forward to robairagapi (port 8081)
         target_url = f"http://localhost:8081/{path}"
-        logger.debug(f"Routing RAG API endpoint {path} to {target_url}")
+        logger.debug(f"🟡 FORWARD (RAG API): → {target_url}")
 
     # Get query parameters
     query_params = dict(request.query_params)

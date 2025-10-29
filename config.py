@@ -20,10 +20,14 @@ class Config:
     """Centralized configuration class with validation."""
 
     # ========================================================================
-    # vLLM Backend Configuration
+    # Model Backend Configuration
     # ========================================================================
-    VLLM_BASE_URL: str = os.getenv("VLLM_BASE_URL", "http://localhost:8078/v1")
-    VLLM_BACKEND_URL: str = os.getenv("VLLM_BASE_URL", "http://localhost:8078").replace("/v1", "")  # Without /v1 suffix
+    # Research model endpoint (used by research agent)
+    RESEARCH_MODEL_URL: str = os.getenv("RESEARCH_MODEL_URL", "http://localhost:8078/v1")
+
+    # Legacy aliases for backward compatibility
+    VLLM_BASE_URL: str = RESEARCH_MODEL_URL  # Alias to RESEARCH_MODEL_URL
+    VLLM_BACKEND_URL: str = RESEARCH_MODEL_URL.replace("/v1", "")  # Without /v1 suffix
     VLLM_TIMEOUT: int = int(os.getenv("VLLM_TIMEOUT", "300"))
 
     # ========================================================================
@@ -88,7 +92,7 @@ class Config:
         print("\n" + "=" * 80)
         print("RESEARCH PROXY CONFIGURATION")
         print("=" * 80)
-        print(f"vLLM Backend:        {cls.VLLM_BASE_URL}")
+        print(f"Research Model:      {cls.RESEARCH_MODEL_URL}")
         print(f"MCP Server:          {cls.REST_API_URL}")
         print(f"MCP API Key:         {'***' + cls.REST_API_KEY[-8:] if cls.REST_API_KEY else 'NOT SET'}")
         print(f"Serper API Key:      {'***' + cls.SERPER_API_KEY[-8:] if cls.SERPER_API_KEY else 'NOT SET'}")
@@ -167,7 +171,7 @@ logger = setup_logging()
 logger.info("=" * 80)
 logger.info("RESEARCH PROXY STARTING")
 logger.info("=" * 80)
-logger.info(f"vLLM Backend:        {config.VLLM_BASE_URL}")
+logger.info(f"Research Model:      {config.RESEARCH_MODEL_URL}")
 logger.info(f"MCP Server:          {config.REST_API_URL}")
 logger.info(f"MCP API Key:         {'***' + config.REST_API_KEY[-8:] if config.REST_API_KEY else 'NOT SET'}")
 logger.info(f"Serper API Key:      {'***' + config.SERPER_API_KEY[-8:] if config.SERPER_API_KEY else 'NOT SET'}")
