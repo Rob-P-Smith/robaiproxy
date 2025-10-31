@@ -57,10 +57,28 @@ class Config:
     LOG_LEVEL: str = os.getenv("LOG_LEVEL", "INFO").upper()
 
     # ========================================================================
+    # Token Validation Configuration
+    # ========================================================================
+    # Enable/disable token counting validation before forwarding to vLLM
+    PRECOUNT_PROMPT_TOKENS: bool = os.getenv("PRECOUNT_PROMPT_TOKENS", "true").lower() == "true"
+    # Maximum context size for the model (from vLLM --max-model-len)
+    MAX_MODEL_CONTEXT: int = int(os.getenv("MAX_MODEL_CONTEXT", "240000"))
+    # Safety margin: reject requests at this percentage of max context (0.95 = 95%)
+    CONTEXT_SAFETY_MARGIN: float = float(os.getenv("CONTEXT_SAFETY_MARGIN", "0.95"))
+    # Timeout for tokenization requests (seconds)
+    TOKENIZE_TIMEOUT: int = int(os.getenv("TOKENIZE_TIMEOUT", "5"))
+    # Log warning when request exceeds this threshold (0.80 = 80%)
+    TOKEN_WARNING_THRESHOLD: float = float(os.getenv("TOKEN_WARNING_THRESHOLD", "0.80"))
+    # Computed effective limits
+    MAX_REQUEST_TOKENS: int = int(MAX_MODEL_CONTEXT * CONTEXT_SAFETY_MARGIN)
+    WARNING_TOKEN_COUNT: int = int(MAX_MODEL_CONTEXT * TOKEN_WARNING_THRESHOLD)
+
+    # ========================================================================
     # Feature Flags
     # ========================================================================
     AUTO_DETECT_MODEL: bool = os.getenv("AUTO_DETECT_MODEL", "true").lower() == "true"
     MODEL_POLL_INTERVAL: int = int(os.getenv("MODEL_POLL_INTERVAL", "2"))
+    ENABLE_INTERNAL_TOOL_CALLING: bool = os.getenv("ENABLE_INTERNAL_TOOL_CALLING", "false").lower() == "true"
 
     @classmethod
     def validate(cls) -> None:
@@ -101,6 +119,12 @@ class Config:
         print(f"Server:              {cls.HOST}:{cls.PORT}")
         print(f"Log Level:           {cls.LOG_LEVEL}")
         print(f"Auto-Detect Model:   {cls.AUTO_DETECT_MODEL}")
+        print(f"Internal Tool Call:  {'ENABLED' if cls.ENABLE_INTERNAL_TOOL_CALLING else 'DISABLED'}")
+        print(f"Token Validation:    {'ENABLED' if cls.PRECOUNT_PROMPT_TOKENS else 'DISABLED'}")
+        if cls.PRECOUNT_PROMPT_TOKENS:
+            print(f"  Max Context:       {cls.MAX_MODEL_CONTEXT:,} tokens")
+            print(f"  Reject Limit:      {cls.MAX_REQUEST_TOKENS:,} tokens ({int(cls.CONTEXT_SAFETY_MARGIN*100)}%)")
+            print(f"  Warning Threshold: {cls.WARNING_TOKEN_COUNT:,} tokens ({int(cls.TOKEN_WARNING_THRESHOLD*100)}%)")
         print("=" * 80 + "\n")
 
 
@@ -180,4 +204,9 @@ logger.info(f"Deep Research:       Max {config.MAX_DEEP_RESEARCH} concurrent")
 logger.info(f"Server:              {config.HOST}:{config.PORT}")
 logger.info(f"Log Level:           {config.LOG_LEVEL}")
 logger.info(f"Log File:            {Path(__file__).parent / 'proxy.log'}")
+logger.info(f"Token Validation:    {'ENABLED' if config.PRECOUNT_PROMPT_TOKENS else 'DISABLED'}")
+if config.PRECOUNT_PROMPT_TOKENS:
+    logger.info(f"  Max Context:       {config.MAX_MODEL_CONTEXT:,} tokens")
+    logger.info(f"  Reject Limit:      {config.MAX_REQUEST_TOKENS:,} tokens ({int(config.CONTEXT_SAFETY_MARGIN*100)}%)")
+    logger.info(f"  Warning Threshold: {config.WARNING_TOKEN_COUNT:,} tokens ({int(config.TOKEN_WARNING_THRESHOLD*100)}%)")
 logger.info("=" * 80)

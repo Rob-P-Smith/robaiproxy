@@ -189,7 +189,7 @@ class PowerManager:
         """
         Start the power manager and register with connection manager.
 
-        Sets initial state to LOW power (fast to switch to auto when request comes).
+        Sets initial state to AUTO power (ready for immediate use).
         """
         if self._running:
             logger.warning("PowerManager already running")
@@ -197,8 +197,8 @@ class PowerManager:
 
         self._running = True
 
-        # Set initial state to LOW power
-        await self.set_power_level(PowerLevel.LOW)
+        # Set initial state to AUTO power
+        await self.set_power_level(PowerLevel.AUTO)
 
         # Register callback with connection manager
         connection_manager.set_activity_callback(self.on_activity_change)
@@ -249,7 +249,7 @@ class PowerManager:
 
 
 # Global singleton instance
-power_manager = PowerManager(idle_timeout_seconds=300)  # 5 minutes
+power_manager = PowerManager(idle_timeout_seconds=3600)  # 1 hour
 
 
 if __name__ == "__main__":

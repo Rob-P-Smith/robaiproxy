@@ -22,6 +22,13 @@ from connectionManager import connection_manager
 # Import power manager
 from powerManager import power_manager
 
+# Import internal tool calling for transparent RAG augmentation
+from internalProxiedToolCalls import (
+    augment_with_rag,
+    create_pondering_stream,
+    wrap_stream_with_rag_indicator
+)
+
 # Global model state
 current_model_name: Optional[str] = None
 current_model_data: Optional[dict] = None  # Full model data from vLLM
@@ -210,6 +217,166 @@ def get_model_name() -> str:
 
 def is_model_available() -> bool:
     return current_model_name is not None
+
+
+async def count_request_tokens(messages: list) -> Optional[int]:
+    """
+    Count tokens in a chat completion request using vLLM's tokenizer.
+
+    Concatenates all message content and calls vLLM's /tokenize endpoint
+    to get accurate token count.
+
+    Args:
+        messages: List of message dicts with 'role' and 'content'
+
+    Returns:
+        int: Token count, or None if tokenization fails
+    """
+    if not config.PRECOUNT_PROMPT_TOKENS:
+        return None
+
+    try:
+        # Concatenate all message content
+        full_text = ""
+        for msg in messages:
+            role = msg.get("role", "")
+            content = msg.get("content", "")
+
+            # Handle string content
+            if isinstance(content, str):
+                full_text += f"{role}: {content}\n"
+            # Handle multimodal content (extract text only)
+            elif isinstance(content, list):
+                text_parts = []
+                for item in content:
+                    if isinstance(item, dict) and item.get("type") == "text":
+                        text_parts.append(item.get("text", ""))
+                full_text += f"{role}: {' '.join(text_parts)}\n"
+
+        # Call vLLM tokenize endpoint
+        async with httpx.AsyncClient(timeout=config.TOKENIZE_TIMEOUT) as client:
+            response = await client.post(
+                f"{config.VLLM_BACKEND_URL}/tokenize",
+                json={"prompt": full_text}
+            )
+            response.raise_for_status()
+            data = response.json()
+
+            # vLLM returns: {"tokens": [123, 456, ...], "count": N}
+            # Try 'count' first, fall back to len(tokens)
+            token_count = data.get("count", len(data.get("tokens", [])))
+            logger.debug(f"Tokenization successful: {token_count} tokens")
+            return token_count
+
+    except httpx.TimeoutException:
+        logger.warning(f"Tokenization timed out after {config.TOKENIZE_TIMEOUT}s - allowing request through (fail-open)")
+        return None
+    except httpx.HTTPStatusError as e:
+        logger.warning(f"Tokenization failed with HTTP {e.response.status_code} - allowing request through (fail-open)")
+        return None
+    except Exception as e:
+        logger.warning(f"Tokenization failed: {str(e)} - allowing request through (fail-open)")
+        return None
+
+
+async def create_token_limit_error_stream(token_count: int, model_name: str):
+    """
+    Generate streaming error response for token limit exceeded.
+
+    Yields SSE-formatted chunks for streaming responses.
+    """
+    from researchAgent import create_sse_chunk
+
+    percentage = round((token_count / config.MAX_MODEL_CONTEXT) * 100, 1)
+
+    error_message = (
+        f"❌ **Request Rejected: Token Limit Exceeded**\n\n"
+        f"Your request contains **{token_count:,} tokens**, which exceeds the configured limit.\n\n"
+        f"**Limits:**\n"
+        f"- Your request: {token_count:,} tokens ({percentage}%)\n"
+        f"- Maximum allowed: {config.MAX_REQUEST_TOKENS:,} tokens (95%)\n"
+        f"- Model capacity: {config.MAX_MODEL_CONTEXT:,} tokens\n\n"
+        f"**Solution:** Please reduce the context size by:\n"
+        f"- Shortening your message\n"
+        f"- Removing older messages from the conversation history\n"
+        f"- Splitting into multiple smaller requests"
+    )
+
+    yield create_sse_chunk(error_message, model=model_name).encode()
+    yield create_sse_chunk("", finish_reason="length", model=model_name).encode()
+    yield b"data: [DONE]\n\n"
+
+
+def create_token_limit_error_sync(token_count: int, model_name: str) -> dict:
+    """
+    Generate sync error response for token limit exceeded.
+
+    Returns dict in OpenAI chat completion format.
+    """
+    percentage = round((token_count / config.MAX_MODEL_CONTEXT) * 100, 1)
+
+    error_message = (
+        f"❌ **Request Rejected: Token Limit Exceeded**\n\n"
+        f"Your request contains **{token_count:,} tokens**, which exceeds the configured limit.\n\n"
+        f"**Limits:**\n"
+        f"- Your request: {token_count:,} tokens ({percentage}%)\n"
+        f"- Maximum allowed: {config.MAX_REQUEST_TOKENS:,} tokens (95%)\n"
+        f"- Model capacity: {config.MAX_MODEL_CONTEXT:,} tokens\n\n"
+        f"**Solution:** Please reduce the context size by:\n"
+        f"- Shortening your message\n"
+        f"- Removing older messages from the conversation history\n"
+        f"- Splitting into multiple smaller requests"
+    )
+
+    return {
+        "id": "chatcmpl-token-limit",
+        "object": "chat.completion",
+        "created": 0,
+        "model": model_name,
+        "choices": [{
+            "index": 0,
+            "message": {
+                "role": "assistant",
+                "content": error_message
+            },
+            "finish_reason": "length"
+        }],
+        "usage": {
+            "prompt_tokens": token_count,
+            "completion_tokens": 0,
+            "total_tokens": token_count
+        }
+    }
+
+
+def validate_token_limit(token_count: int) -> bool:
+    """
+    Validate that token count doesn't exceed the configured limit.
+
+    Args:
+        token_count: Number of tokens in the request
+
+    Returns:
+        bool: True if within limit, False if exceeds
+    """
+    # Log warning if over threshold
+    if token_count >= config.WARNING_TOKEN_COUNT:
+        percentage = (token_count / config.MAX_MODEL_CONTEXT) * 100
+        logger.warning(
+            f"⚠️  Request approaching token limit: {token_count:,} tokens "
+            f"({percentage:.1f}% of {config.MAX_MODEL_CONTEXT:,})"
+        )
+
+    # Reject if over limit
+    if token_count > config.MAX_REQUEST_TOKENS:
+        logger.error(
+            f"❌ Request EXCEEDS token limit: {token_count:,} tokens "
+            f"(limit: {config.MAX_REQUEST_TOKENS:,}, max: {config.MAX_MODEL_CONTEXT:,})"
+        )
+        return False
+
+    # Valid - within limit
+    return True
 
 
 async def check_research_health() -> tuple[bool, str]:
@@ -663,6 +830,10 @@ async def autonomous_chat(request: Request):
     messages = body.get("messages", [])
     stream = body.get("stream", False)
 
+    # TEMP: Log message structure to verify conversation tracking assumptions
+    message_summary = [{"role": msg.get("role"), "content_preview": msg.get("content", "")[:50]} for msg in messages]
+    logger.info(f"📨 MESSAGE STRUCTURE ({len(messages)} messages): {message_summary}")
+
     # Log first 20 words of last user message
     if messages:
         last_msg = messages[-1].get("content", "")
@@ -671,6 +842,73 @@ async def autonomous_chat(request: Request):
             preview = " ".join(words) + ("..." if len(last_msg.split()) > 20 else "")
             logger.debug(f"📝 REQUEST PREVIEW: {preview}")
 
+    # Transparent RAG augmentation for first messages (if enabled)
+    rag_info = {"used": False, "query": "", "succeeded": False, "url": ""}
+    should_augment_with_rag = False
+
+    # Pre-check if we should augment (before starting stream)
+    if config.ENABLE_INTERNAL_TOOL_CALLING and stream:
+        # Import detection functions
+        from internalProxiedToolCalls import is_first_user_message, has_research_keyword
+
+        # Check if this is a first message that should be augmented
+        if is_first_user_message(messages) and not has_research_keyword(messages):
+            should_augment_with_rag = True
+            logger.debug("✅ Pre-check: Will augment with RAG and show Pondering")
+        else:
+            logger.debug("⏭️  Pre-check: Not a first message, skipping RAG")
+
+    if should_augment_with_rag:
+        # Track connection ID at the outer scope
+        path = request.url.path
+        connection_id = ""
+        if path not in connection_manager.excluded_endpoints:
+            connection_id = await connection_manager.add_connection(request, path)
+            logger.debug(f"Connection tracking started (RAG): {connection_id} for {path}")
+
+        async def stream_with_rag_augmentation():
+            nonlocal rag_info, body, messages
+            try:
+                # Send "Pondering..." while we do RAG lookup
+                async for chunk in create_pondering_stream(get_model_name()):
+                    yield chunk.encode()
+
+                # Now do the RAG augmentation
+                body, rag_info = await augment_with_rag(body, messages, get_model_name())
+                messages = body.get("messages", [])
+
+                # Forward request to vLLM and wrap the response
+                async with httpx.AsyncClient(timeout=config.VLLM_TIMEOUT) as client:
+                    async with client.stream(
+                        "POST",
+                        f"{config.VLLM_BASE_URL}/chat/completions",
+                        json=body
+                    ) as response:
+                        response.raise_for_status()
+
+                        # Wrap the upstream stream to inject RAG indicator
+                        async for chunk in wrap_stream_with_rag_indicator(
+                            response.aiter_bytes(),
+                            get_model_name(),
+                            rag_info
+                        ):
+                            yield chunk
+            finally:
+                # Clean up connection tracking when stream completes
+                if connection_id:
+                    await connection_manager.remove_connection(connection_id)
+                    logger.debug(f"Connection tracking ended (RAG): {connection_id}")
+
+        return StreamingResponse(
+            stream_with_rag_augmentation(),
+            media_type="text/event-stream"
+        )
+
+    # For non-streaming requests, check if we should augment (no pre-check needed since no pondering)
+    if config.ENABLE_INTERNAL_TOOL_CALLING and not stream:
+        body, rag_info = await augment_with_rag(body, messages, get_model_name())
+        messages = body.get("messages", [])  # Update messages in case they were augmented
+
     # Add connection tracking EARLY (before any early returns)
     # This ensures even multimodal requests trigger power management
     path = request.url.path
@@ -678,6 +916,29 @@ async def autonomous_chat(request: Request):
     if path not in connection_manager.excluded_endpoints:
         connection_id = await connection_manager.add_connection(request, path)
         logger.debug(f"Connection tracking started: {connection_id} for {path}")
+
+    # Validate token count AFTER connection tracking (triggers power management)
+    # This happens before forwarding to vLLM to prevent oversized requests
+    if config.PRECOUNT_PROMPT_TOKENS:
+        token_count = await count_request_tokens(messages)
+        if token_count is not None:
+            is_valid = validate_token_limit(token_count)
+            if not is_valid:
+                # Remove connection tracking before returning error
+                if connection_id:
+                    await connection_manager.remove_connection(connection_id)
+
+                # Return error response in appropriate format
+                model_for_error = get_model_name()
+                if stream:
+                    logger.info(f"Returning token limit error as STREAMING response")
+                    return StreamingResponse(
+                        create_token_limit_error_stream(token_count, model_for_error),
+                        media_type="text/event-stream"
+                    )
+                else:
+                    logger.info(f"Returning token limit error as SYNC response")
+                    return create_token_limit_error_sync(token_count, model_for_error)
 
     # Check if model is available, wait up to 30 seconds if not
     if not is_model_available():
