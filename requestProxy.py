@@ -2,19 +2,31 @@
 # FastAPI proxy server - routes requests between passthrough and research modes
 
 from fastapi import FastAPI, Request, HTTPException
-from fastapi.responses import StreamingResponse, Response
+from fastapi.responses import StreamingResponse, JSONResponse, Response
 import httpx
 import re
+import json
 import asyncio
 from asyncio import Semaphore
-from typing import Optional
+from typing import Optional, Dict, Tuple
 from contextlib import asynccontextmanager
+import hashlib
+import time
 
 # Load configuration from environment variables
 from config import config, logger
 
-# Import research functions from researchAgent
-from researchAgent import research_mode_stream, research_mode_sync
+# Import research and RAG functions from robaimultiturn library
+from robaimultiturn import (
+    research_stream,
+    research_sync,
+    augment_with_rag,
+    create_pondering_stream,
+    wrap_stream_with_rag_indicator,
+    check_if_first_user_message,
+    has_research_keyword,
+    create_sse_chunk
+)
 
 # Import connection manager
 from connectionManager import connection_manager
@@ -22,12 +34,10 @@ from connectionManager import connection_manager
 # Import power manager
 from powerManager import power_manager
 
-# Import internal tool calling for transparent RAG augmentation
-from internalProxiedToolCalls import (
-    augment_with_rag,
-    create_pondering_stream,
-    wrap_stream_with_rag_indicator
-)
+# Import new metadata-driven modules
+from sessionManager import session_manager
+from rateLimiter import rate_limiter
+from analytics import analytics_tracker
 
 # Global model state
 current_model_name: Optional[str] = None
@@ -285,8 +295,6 @@ async def create_token_limit_error_stream(token_count: int, model_name: str):
 
     Yields SSE-formatted chunks for streaming responses.
     """
-    from researchAgent import create_sse_chunk
-
     percentage = round((token_count / config.MAX_MODEL_CONTEXT) * 100, 1)
 
     error_message = (
@@ -451,8 +459,6 @@ async def model_loading_response_stream(model_name: str = "unknown-model"):
     Yields:
         bytes: SSE chunks with loading message
     """
-    from researchAgent import create_sse_chunk
-
     message = "⏳ The model is currently loading. Please stand by...\n\n"
     message += "The vLLM backend is starting up. This usually takes 30-60 seconds.\n\n"
     message += "Please try your request again in a moment when the model is available."
@@ -509,10 +515,28 @@ async def lifespan(app: FastAPI):
     await power_manager.start()
     logger.info("Power manager started")
 
+    # Start rate limiter cleanup task
+    await rate_limiter.start_cleanup_task()
+    logger.info("Rate limiter cleanup task started")
+
+    # Start analytics cleanup task
+    if config.ENABLE_ANALYTICS:
+        await analytics_tracker.start_cleanup_task()
+        logger.info("Analytics tracker started")
+
     yield
 
     # Cleanup on shutdown
-    # Stop power manager first
+    # Stop analytics tracker
+    if config.ENABLE_ANALYTICS:
+        await analytics_tracker.stop_cleanup_task()
+        logger.info("Analytics tracker stopped")
+
+    # Stop rate limiter cleanup
+    await rate_limiter.stop_cleanup_task()
+    logger.info("Rate limiter cleanup stopped")
+
+    # Stop power manager
     await power_manager.stop()
     logger.info("Power manager stopped")
 
@@ -527,6 +551,49 @@ async def lifespan(app: FastAPI):
 
 
 app = FastAPI(lifespan=lifespan, openapi_url=None)  # Disable auto-generated OpenAPI
+
+
+async def check_admin_authorization(request: Request) -> bool:
+    """
+    Check if the request is authorized for admin endpoints.
+
+    Only "Robert P Smith" is authorized to access admin endpoints.
+    Checks both custom headers and metadata in request body.
+
+    Args:
+        request: FastAPI Request object
+
+    Returns:
+        True if authorized, False otherwise
+    """
+    # First check custom header (easiest for GET requests)
+    auth_user = request.headers.get("X-User-Name", "")
+    if auth_user == "Robert P Smith":
+        return True
+
+    # Check for authorization token that maps to Robert P Smith
+    auth_token = request.headers.get("X-Admin-Token", "")
+    # Use a secure token for admin access (this should be in config in production)
+    if auth_token == "RobertPSmith-AdminAccess-2025":
+        return True
+
+    # For requests with JSON body, check metadata
+    if request.headers.get("content-type") == "application/json":
+        try:
+            # Read body without consuming it
+            body_bytes = await request.body()
+            body_text = body_bytes.decode('utf-8')
+            body = json.loads(body_text) if body_text else {}
+
+            # Check metadata for user name
+            metadata = body.get("metadata", {})
+            user_name = metadata.get("variables", {}).get("{{USER_NAME}}", "")
+            if user_name == "Robert P Smith":
+                return True
+        except Exception as e:
+            logger.debug(f"Error checking authorization in body: {e}")
+
+    return False
 
 
 # Research keyword configuration
@@ -621,6 +688,59 @@ def is_multimodal(messages: list) -> bool:
     return False
 
 
+def extract_text_only_messages(messages: list) -> list:
+    """
+    Extract text-only version of messages for token counting.
+
+    For multimodal messages (where content is a list), extracts only the text parts.
+    For regular messages (where content is a string), returns as-is.
+
+    This is used for token validation of multimodal requests - we need to validate
+    that the text portion doesn't exceed context limits, even though images are
+    handled separately by vLLM.
+
+    Args:
+        messages (list): List of message dict objects with 'role' and 'content' keys
+
+    Returns:
+        list: Messages with only text content (images/audio removed)
+
+    Example:
+        Input: [{"role": "user", "content": [
+            {"type": "text", "text": "What's in this image?"},
+            {"type": "image_url", "image_url": {...}}
+        ]}]
+
+        Output: [{"role": "user", "content": "What's in this image?"}]
+
+    Used by:
+        - autonomous_chat(): Token validation for multimodal requests
+    """
+    text_only_messages = []
+
+    for msg in messages:
+        content = msg.get("content")
+
+        # If content is a list (multimodal), extract only text parts
+        if isinstance(content, list):
+            text_parts = []
+            for item in content:
+                if isinstance(item, dict) and item.get("type") == "text":
+                    text_parts.append(item.get("text", ""))
+
+            # Join all text parts with space
+            text_content = " ".join(text_parts)
+            text_only_messages.append({
+                "role": msg.get("role"),
+                "content": text_content
+            })
+        else:
+            # Regular text message, keep as-is
+            text_only_messages.append(msg)
+
+    return text_only_messages
+
+
 
 
 async def passthrough_stream(body: dict, request: Request = None):
@@ -661,15 +781,11 @@ async def passthrough_stream(body: dict, request: Request = None):
         # Connection errors indicate vLLM might be down - trigger refresh
         logger.error(f"[ReqID: {request_id}] Connection error in passthrough_stream: {str(e)}")
         trigger_model_refresh()
-        # Import SSE chunk creator from research agent for error formatting
-        from researchAgent import create_sse_chunk
         error_chunk = create_sse_chunk(f"vLLM backend unavailable: {str(e)}", finish_reason="error")
         yield error_chunk.encode()
         yield b"data: [DONE]\n\n"
     except Exception as e:
         logger.error(f"[ReqID: {request_id}] Exception in passthrough_stream: {str(e)}")
-        # Import SSE chunk creator from research agent for error formatting
-        from researchAgent import create_sse_chunk
         error_chunk = create_sse_chunk(f"Error: {str(e)}", finish_reason="error")
         yield error_chunk.encode()
         yield b"data: [DONE]\n\n"
@@ -744,8 +860,6 @@ async def research_with_queue_management(body: dict, model: str, iterations: int
     Yields:
         bytes: SSE-formatted chunks (queue messages, research results, or errors)
     """
-    from researchAgent import create_sse_chunk
-
     # Check if queue is full
     is_queue_full = semaphore.locked()
 
@@ -759,8 +873,8 @@ async def research_with_queue_management(body: dict, model: str, iterations: int
                 f"❌ Service unavailable: {error_msg}. Cannot queue research request.",
                 finish_reason="error",
                 model=model
-            ).encode()
-            yield b"data: [DONE]\n\n"
+            )
+            yield "data: [DONE]\n\n"
             return
 
         # Send detailed queue status message
@@ -768,71 +882,78 @@ async def research_with_queue_management(body: dict, model: str, iterations: int
         yield create_sse_chunk(
             f"⏳ Research queue is full. {queue_status}. Your request is pending...\n\n",
             model=model
-        ).encode()
+        )
 
     # Acquire semaphore (waits if queue is full, immediate if available)
     async with semaphore:
-        # Proceed with research streaming
-        async for chunk in research_mode_stream(body, model_name=model, max_iterations=iterations, request=request):
+        # Proceed with research streaming - pass proxy config to robaimultiturn
+        async for chunk in research_stream(
+            body,
+            model_name=model,
+            max_iterations=iterations,
+            vllm_url=config.VLLM_BACKEND_URL + "/v1",
+            mcp_url=config.REST_API_URL,
+            mcp_api_key=config.REST_API_KEY,
+            serper_api_key=config.SERPER_API_KEY,
+            request=request
+        ):
             yield chunk
 
 
 @app.post("/v1/chat/completions")
 async def autonomous_chat(request: Request):
     """
-    Main OpenAI-compatible chat completions endpoint with research mode routing.
+    Main OpenAI-compatible chat completions endpoint with metadata-driven processing.
 
-    This is the primary endpoint that receives chat completion requests. It analyzes
-    the last user message and routes to either comprehensive research mode (if message
-    starts with "research") or transparent passthrough mode (normal LLM requests).
+    Leverages metadata from robai-webui for:
+    - Session tracking by chat_id
+    - User-aware rate limiting
+    - Personalized responses
+    - Accurate token validation
+    - Connection tracking with message_id
+    - Analytics and usage tracking
 
-    Model Availability Handling:
-        - If model is not yet loaded, waits up to 30 seconds
-        - If model doesn't load in time, returns friendly "loading" message
-        - User can retry their request once model is ready
-
-    Research Mode Flow:
-        1. Detects "research" keyword in last user message
-        2. Determines iteration count (2 for standard, 4 for deep research)
-        3. Calls Serper API for 10 initial web search results
-        4. Performs 2-4 iterations of:
-           - LLM-generated search → search_memory (3 results for standard, 6 for deep)
-           - URL generation → crawl 3 URLs
-           - Generate 1 distinct Serper query → 1 web search (5 results)
-        5. Builds massive accumulated context (potentially 100K+ tokens)
-        6. Generates final answer with all research context
-        7. Wraps research progress in  (^)(tag
-
-    Passthrough Mode Flow:
-        1. Forwards request directly to vLLM
-        2. Streams/returns response transparently
-        3. No modifications to request or response
+    Request Flow:
+    1. Extract metadata (chat_id, user_id, message_id)
+    2. Session management (get/create, check first message)
+    3. Connection tracking with metadata
+    4. User rate limiting check
+    5. Token validation using model info from metadata
+    6. Model availability check
+    7. Multimodal passthrough
+    8. Session-aware RAG (only once per chat)
+    9. Research detection with session tracking
+    10. Standard passthrough with analytics
 
     Args:
-        request (Request): FastAPI Request object containing JSON body with:
-            - messages (list): Chat messages
-            - stream (bool): Whether to stream response
-            - max_tokens (int): Max tokens to generate
-            - temperature (float): Sampling temperature
-            - stream_options (dict): Streaming options like include_usage
+        request: FastAPI Request object with JSON body and metadata
 
     Returns:
-        StreamingResponse or dict: Either streaming SSE response or JSON completion
-
-    Used by:
-        - External clients as OpenAI-compatible API endpoint
+        StreamingResponse or JSONResponse
     """
-    # LOG INCOMING REQUEST DETAILS
-    client_ip = request.client.host if request.client else "unknown"
-    logger.debug(f"🔵 ROUTE: /v1/chat/completions | FROM: {client_ip} | HANDLER: autonomous_chat")
-
+    # ========================================================================
+    # STEP 1: Parse request body and extract metadata
+    # ========================================================================
     body = await request.json()
+    metadata = body.get("metadata", {})
     messages = body.get("messages", [])
     stream = body.get("stream", False)
 
-    # TEMP: Log message structure to verify conversation tracking assumptions
-    message_summary = [{"role": msg.get("role"), "content_preview": msg.get("content", "")[:50]} for msg in messages]
-    logger.info(f"📨 MESSAGE STRUCTURE ({len(messages)} messages): {message_summary}")
+    # Extract key identifiers from metadata
+    chat_id = metadata.get("chat_id")
+    user_id = metadata.get("user_id")
+    message_id = metadata.get("message_id")
+    session_id = metadata.get("session_id")
+    user_variables = metadata.get("variables", {})
+    user_name = user_variables.get("{{USER_NAME}}", "Unknown")
+
+    # Structured logging with metadata context
+    logger.info(
+        f"📨 Chat Request | "
+        f"User: {user_name} ({user_id[:8] if user_id else 'anon'}...) | "
+        f"Chat: {chat_id[:8] if chat_id else 'ephemeral'}... | "
+        f"Message: {message_id[:8] if message_id else 'unknown'}..."
+    )
 
     # Log first 20 words of last user message
     if messages:
@@ -842,112 +963,129 @@ async def autonomous_chat(request: Request):
             preview = " ".join(words) + ("..." if len(last_msg.split()) > 20 else "")
             logger.debug(f"📝 REQUEST PREVIEW: {preview}")
 
-    # Transparent RAG augmentation for first messages (if enabled)
-    rag_info = {"used": False, "query": "", "succeeded": False, "url": ""}
-    should_augment_with_rag = False
-
-    # Pre-check if we should augment (before starting stream)
-    if config.ENABLE_INTERNAL_TOOL_CALLING and stream:
-        # Import detection functions
-        from internalProxiedToolCalls import is_first_user_message, has_research_keyword
-
-        # Check if this is a first message that should be augmented
-        if is_first_user_message(messages) and not has_research_keyword(messages):
-            should_augment_with_rag = True
-            logger.debug("✅ Pre-check: Will augment with RAG and show Pondering")
-        else:
-            logger.debug("⏭️  Pre-check: Not a first message, skipping RAG")
-
-    if should_augment_with_rag:
-        # Track connection ID at the outer scope
-        path = request.url.path
-        connection_id = ""
-        if path not in connection_manager.excluded_endpoints:
-            connection_id = await connection_manager.add_connection(request, path)
-            logger.debug(f"Connection tracking started (RAG): {connection_id} for {path}")
-
-        async def stream_with_rag_augmentation():
-            nonlocal rag_info, body, messages
-            try:
-                # Send "Pondering..." while we do RAG lookup
-                async for chunk in create_pondering_stream(get_model_name()):
-                    yield chunk.encode()
-
-                # Now do the RAG augmentation
-                body, rag_info = await augment_with_rag(body, messages, get_model_name())
-                messages = body.get("messages", [])
-
-                # Forward request to vLLM and wrap the response
-                async with httpx.AsyncClient(timeout=config.VLLM_TIMEOUT) as client:
-                    async with client.stream(
-                        "POST",
-                        f"{config.VLLM_BASE_URL}/chat/completions",
-                        json=body
-                    ) as response:
-                        response.raise_for_status()
-
-                        # Wrap the upstream stream to inject RAG indicator
-                        async for chunk in wrap_stream_with_rag_indicator(
-                            response.aiter_bytes(),
-                            get_model_name(),
-                            rag_info
-                        ):
-                            yield chunk
-            finally:
-                # Clean up connection tracking when stream completes
-                if connection_id:
-                    await connection_manager.remove_connection(connection_id)
-                    logger.debug(f"Connection tracking ended (RAG): {connection_id}")
-
-        return StreamingResponse(
-            stream_with_rag_augmentation(),
-            media_type="text/event-stream"
-        )
-
-    # For non-streaming requests, check if we should augment (no pre-check needed since no pondering)
-    if config.ENABLE_INTERNAL_TOOL_CALLING and not stream:
-        body, rag_info = await augment_with_rag(body, messages, get_model_name())
-        messages = body.get("messages", [])  # Update messages in case they were augmented
-
-    # Add connection tracking EARLY (before any early returns)
-    # This ensures even multimodal requests trigger power management
+    # ========================================================================
+    # STEP 2-4: Run independent operations concurrently for better performance
+    # ========================================================================
+    # Prepare data for concurrent operations
     path = request.url.path
-    connection_id = ""
-    if path not in connection_manager.excluded_endpoints:
-        connection_id = await connection_manager.add_connection(request, path)
-        logger.debug(f"Connection tracking started: {connection_id} for {path}")
+    estimated_tokens = sum(len(str(msg.get("content", ""))) // 4 for msg in messages)
 
-    # Validate token count AFTER connection tracking (triggers power management)
-    # This happens before forwarding to vLLM to prevent oversized requests
+    # Run session management, connection tracking, and rate limiting concurrently
+    session_task, connection_task, rate_task = await asyncio.gather(
+        session_manager.get_or_create_session(metadata),
+        connection_manager.add_connection(request, path, metadata),
+        rate_limiter.check_and_update(metadata, estimated_tokens)
+    )
+
+    # Unpack results
+    session = session_task
+    connection_id = connection_task
+    rate_allowed, rate_reason = rate_task
+
+    is_first_message = session.get("is_first_message", False)
+
+    logger.debug(
+        f"Session state | Message #{session['message_count']} | "
+        f"Tokens: {session.get('total_tokens', 0)} | "
+        f"RAG: {session.get('rag_augmented', False)} | "
+        f"First: {is_first_message}"
+    )
+    logger.debug(f"Connection tracking started: {connection_id[:8] if connection_id else 'none'}...")
+
+    # Check rate limiting result
+    if not rate_allowed:
+        # Clean up connection and return rate limit error
+        if connection_id:
+            await connection_manager.remove_connection(connection_id)
+
+        # Log analytics
+        if config.ENABLE_ANALYTICS:
+            await analytics_tracker.log_request(metadata, 0, "rate_limited", error=True)
+
+        error_response = {
+            "error": {
+                "message": rate_reason,
+                "type": "rate_limit_error",
+                "code": "rate_limit_exceeded"
+            }
+        }
+
+        logger.warning(f"Rate limit exceeded for {user_name} ({user_id[:8] if user_id else 'anon'}...)")
+
+        if stream:
+            async def error_stream():
+                yield f"data: {json.dumps(error_response)}\n\n"
+                yield "data: [DONE]\n\n"
+            return StreamingResponse(error_stream(), media_type="text/event-stream")
+        else:
+            return JSONResponse(status_code=429, content=error_response)
+
+    # ========================================================================
+    # STEP 5: Check for multimodal content early (instant detection)
+    # ========================================================================
+    is_multimodal_request = is_multimodal(messages)
+    if is_multimodal_request:
+        logger.debug("🖼️  Multimodal content detected - will validate text portion and passthrough to vLLM")
+
+    # ========================================================================
+    # STEP 6: Model-aware token validation (using metadata model info)
+    # ========================================================================
+    # Get model limits from metadata instead of hardcoding
+    model_info = metadata.get("model", {})
+    max_context = model_info.get("max_model_len", config.MAX_MODEL_CONTEXT)
+    model_name = model_info.get("id", get_model_name())
+
     if config.PRECOUNT_PROMPT_TOKENS:
-        token_count = await count_request_tokens(messages)
+        # Extract text-only messages for token counting
+        messages_for_tokenization = extract_text_only_messages(messages) if is_multimodal_request else messages
+
+        if is_multimodal_request:
+            logger.debug("🔢 Validating text portion of multimodal request for token limits")
+
+        token_count = await count_request_tokens(messages_for_tokenization)
         if token_count is not None:
-            is_valid = validate_token_limit(token_count)
-            if not is_valid:
-                # Remove connection tracking before returning error
+            # Use 95% threshold to leave room for response
+            token_limit = int(max_context * config.CONTEXT_SAFETY_MARGIN)
+
+            if token_count > token_limit:
+                # Clean up and log analytics
                 if connection_id:
                     await connection_manager.remove_connection(connection_id)
 
-                # Return error response in appropriate format
-                model_for_error = get_model_name()
+                if config.ENABLE_ANALYTICS:
+                    await analytics_tracker.log_request(metadata, token_count, "token_exceeded", error=True)
+
+                error_type = "multimodal text portion" if is_multimodal_request else "request"
+                error_msg = f"Token limit exceeded for {error_type}: {token_count} tokens (max: {token_limit} for model {model_name})"
+                logger.info(f"❌ {error_msg}")
+
                 if stream:
-                    logger.info(f"Returning token limit error as STREAMING response")
                     return StreamingResponse(
-                        create_token_limit_error_stream(token_count, model_for_error),
+                        create_token_limit_error_stream(token_count, model_name),
                         media_type="text/event-stream"
                     )
                 else:
-                    logger.info(f"Returning token limit error as SYNC response")
-                    return create_token_limit_error_sync(token_count, model_for_error)
+                    return create_token_limit_error_sync(token_count, model_name)
 
-    # Check if model is available, wait up to 30 seconds if not
+    # ========================================================================
+    # STEP 7: Check model availability (wait if necessary)
+    # ========================================================================
     if not is_model_available():
         logger.warning("Model not yet available, waiting up to 30 seconds...")
         model_ready = await wait_for_model(max_wait_seconds=30)
 
         if not model_ready:
-            logger.warning("Model still not available after 30 seconds, returning loading message")
-            model_name = get_model_name()
+            logger.warning("Model still not available after 30 seconds")
+            # Clean up and log analytics
+            if connection_id:
+                await connection_manager.remove_connection(connection_id)
+
+            if config.ENABLE_ANALYTICS:
+                await analytics_tracker.log_request(metadata, 0, "model_unavailable", error=True)
+
+            # Personalized loading message using metadata
+            loading_msg = f"Hi {user_name}, the model is still loading. Please try again in a moment."
+
             if stream:
                 return StreamingResponse(
                     model_loading_response_stream(model_name),
@@ -958,63 +1096,353 @@ async def autonomous_chat(request: Request):
         else:
             logger.info("Model became available, proceeding with request")
 
-    try:
-        # Check for multimodal content first - always passthrough if present
-        if is_multimodal(messages):
-            logger.debug("🖼️  Multimodal content detected - passing through to vLLM")
+    # ========================================================================
+    # STEP 8: Handle multimodal requests (early passthrough)
+    # ========================================================================
+    if is_multimodal_request:
+        try:
+            logger.debug(f"🖼️  Routing multimodal request for chat {chat_id[:8] if chat_id else 'ephemeral'}...")
+
+            # Update session with multimodal flag
+            if chat_id:
+                await session_manager.update_session(chat_id, {
+                    "last_multimodal": time.time()
+                })
+
+            # Log analytics
+            if config.ENABLE_ANALYTICS:
+                await analytics_tracker.log_request(metadata, estimated_tokens, "multimodal")
+
             if stream:
                 return StreamingResponse(
                     passthrough_stream(body, request),
                     media_type="text/event-stream"
                 )
             else:
-                return await passthrough_sync(body)
+                result = await passthrough_sync(body)
+                # Update token usage from response
+                if isinstance(result, dict) and "usage" in result:
+                    actual_tokens = result["usage"].get("total_tokens", 0)
+                    if chat_id:
+                        await session_manager.add_tokens(chat_id, actual_tokens)
+                return result
+        finally:
+            # Clean up connection tracking
+            if connection_id:
+                await connection_manager.remove_connection(connection_id)
 
+    # ========================================================================
+    # STEP 9: Session-aware RAG augmentation (only once per chat)
+    # ========================================================================
+    rag_info = {"used": False, "query": "", "succeeded": False, "url": ""}
+
+    # Only augment first message if not already done for this chat
+    should_augment_with_rag = (
+        config.ENABLE_INTERNAL_TOOL_CALLING and
+        is_first_message and
+        not session.get("rag_augmented", False) and
+        not has_research_keyword(messages)
+    )
+
+    if should_augment_with_rag:
+        logger.debug(f"✅ Will augment first message with RAG for chat {chat_id[:8] if chat_id else 'ephemeral'}...")
+    else:
+        reasons = []
+        if not config.ENABLE_INTERNAL_TOOL_CALLING:
+            reasons.append("disabled")
+        if not is_first_message:
+            reasons.append("not first")
+        if session.get("rag_augmented", False):
+            reasons.append("already done")
+        if has_research_keyword(messages):
+            reasons.append("research mode")
+        logger.debug(f"⏭️  Skipping RAG: {', '.join(reasons)}")
+
+
+    if should_augment_with_rag and stream:
+        # Streaming RAG with pondering indicator
+        async def stream_with_rag_augmentation():
+            nonlocal rag_info, body, messages
+            try:
+                # Send "Pondering..." while we do RAG lookup
+                async for chunk in create_pondering_stream(model_name):
+                    yield chunk.encode()
+
+                # Do the RAG augmentation
+                body, rag_info = await augment_with_rag(
+                    body,
+                    messages,
+                    model_name,
+                    vllm_url=config.VLLM_BACKEND_URL + "/v1",
+                    ragapi_url="http://localhost:8081"
+                )
+                messages = body.get("messages", [])
+
+                # Mark session as RAG augmented
+                if chat_id:
+                    await session_manager.mark_rag_augmented(chat_id)
+
+                # Log analytics
+                if config.ENABLE_ANALYTICS:
+                    await analytics_tracker.log_request(metadata, estimated_tokens, "rag")
+
+                # Forward to vLLM and wrap response
+                async with httpx.AsyncClient(timeout=config.VLLM_TIMEOUT) as client:
+                    async with client.stream(
+                        "POST",
+                        f"{config.VLLM_BASE_URL}/chat/completions",
+                        json=body
+                    ) as response:
+                        response.raise_for_status()
+
+                        # Track actual tokens from stream
+                        token_count = 0
+                        async for chunk in wrap_stream_with_rag_indicator(
+                            response.aiter_bytes(),
+                            model_name,
+                            rag_info
+                        ):
+                            token_count += len(chunk) // 40  # Rough estimate
+                            yield chunk
+
+                        # Update session tokens
+                        if chat_id:
+                            await session_manager.add_tokens(chat_id, token_count)
+            finally:
+                # Clean up connection
+                if connection_id:
+                    await connection_manager.remove_connection(connection_id)
+
+        return StreamingResponse(
+            stream_with_rag_augmentation(),
+            media_type="text/event-stream"
+        )
+
+    # Non-streaming RAG augmentation
+    if should_augment_with_rag and not stream:
+        body, rag_info = await augment_with_rag(
+            body,
+            messages,
+            model_name,
+            vllm_url=config.VLLM_BACKEND_URL + "/v1",
+            ragapi_url="http://localhost:8081"
+        )
+        messages = body.get("messages", [])
+
+        # Mark session and log analytics
+        if chat_id:
+            await session_manager.mark_rag_augmented(chat_id)
+        if config.ENABLE_ANALYTICS:
+            await analytics_tracker.log_request(metadata, estimated_tokens, "rag")
+
+    # ========================================================================
+    # STEP 10: Research mode detection and routing with session tracking
+    # ========================================================================
+    try:
         # Detect research mode and iteration count
         is_research, iterations = detect_research_mode(messages)
 
-        # Debug logging
-        logger.info(f"Request received. Research mode: {is_research}, Iterations: {iterations}")
-
-        # Extract Authorization header and log first 6 characters of bearer token
-        auth_header = request.headers.get("Authorization")
-        if auth_header and auth_header.startswith("Bearer "):
-            token = auth_header[7:]  # Remove "Bearer " prefix
-            masked_token = token[:6] + "..."
-            logger.info(f"Bearer token received: {masked_token}")
+        logger.info(f"Research mode: {is_research}, Iterations: {iterations if is_research else 'N/A'}")
 
         if is_research:
-            # Get current model name for research mode
-            model = get_model_name()
+            # Update session research count
+            if chat_id:
+                await session_manager.increment_research_count(chat_id)
 
-            # Determine which semaphore to use based on iteration count
+            # Log analytics
+            if config.ENABLE_ANALYTICS:
+                await analytics_tracker.log_request(metadata, estimated_tokens, "research")
+
+            logger.info(
+                f"🔬 Research mode | User: {user_name} | "
+                f"Chat: {chat_id[:8] if chat_id else 'ephemeral'}... | "
+                f"Iterations: {iterations}"
+            )
+
+            # Determine which semaphore to use
             semaphore = deep_research_semaphore if iterations == 4 else research_semaphore
             is_deep = iterations == 4
 
             if stream:
-                # Streaming: use queue management wrapper
+                # Streaming research with queue management
+                async def research_stream_with_tracking():
+                    token_count = 0
+                    async for chunk in research_with_queue_management(
+                        body, model_name, iterations, request, semaphore, is_deep
+                    ):
+                        token_count += len(chunk) // 40  # Rough estimate
+                        yield chunk
+
+                    # Update session tokens
+                    if chat_id:
+                        await session_manager.add_tokens(chat_id, token_count)
+
+                    # Clean up connection
+                    if connection_id:
+                        await connection_manager.remove_connection(connection_id)
+
                 return StreamingResponse(
-                    research_with_queue_management(body, model, iterations, request, semaphore, is_deep),
+                    research_stream_with_tracking(),
                     media_type="text/event-stream"
                 )
             else:
-                # Non-streaming: wait silently for semaphore, no queue messages
+                # Non-streaming research
                 async with semaphore:
-                    return await research_mode_sync(body, model_name=model, max_iterations=iterations)
+                    result = await research_sync(
+                        body,
+                        model_name=model_name,
+                        max_iterations=iterations,
+                        vllm_url=config.VLLM_BACKEND_URL + "/v1",
+                        mcp_url=config.REST_API_URL,
+                        mcp_api_key=config.REST_API_KEY
+                    )
+
+                    # Update session tokens and clean up
+                    if isinstance(result, dict) and "usage" in result:
+                        actual_tokens = result["usage"].get("total_tokens", 0)
+                        if chat_id:
+                            await session_manager.add_tokens(chat_id, actual_tokens)
+
+                    if connection_id:
+                        await connection_manager.remove_connection(connection_id)
+
+                    return result
+
+        # ========================================================================
+        # STEP 11: Standard passthrough with analytics tracking
+        # ========================================================================
+        logger.debug(f"🟢 Standard passthrough for chat {chat_id[:8] if chat_id else 'ephemeral'}...")
+
+        # Log analytics for standard request
+        if config.ENABLE_ANALYTICS:
+            await analytics_tracker.log_request(metadata, estimated_tokens, "standard")
+
+        if stream:
+            # Streaming passthrough with token tracking
+            async def passthrough_stream_with_tracking():
+                token_count = 0
+                async for chunk in passthrough_stream(body, request):
+                    token_count += len(chunk) // 40  # Rough estimate
+                    yield chunk
+
+                # Update session tokens
+                if chat_id:
+                    await session_manager.add_tokens(chat_id, token_count)
+
+                # Clean up connection
+                if connection_id:
+                    await connection_manager.remove_connection(connection_id)
+
+            return StreamingResponse(
+                passthrough_stream_with_tracking(),
+                media_type="text/event-stream"
+            )
         else:
-            # Pure pass-through - proxy is invisible
-            if stream:
-                return StreamingResponse(
-                    passthrough_stream(body, request),
-                    media_type="text/event-stream"
-                )
-            else:
-                return await passthrough_sync(body)
-    finally:
-        # Remove connection tracking when response is complete
+            # Non-streaming passthrough
+            result = await passthrough_sync(body)
+
+            # Update session tokens from response
+            if isinstance(result, dict) and "usage" in result:
+                actual_tokens = result["usage"].get("total_tokens", 0)
+                if chat_id:
+                    await session_manager.add_tokens(chat_id, actual_tokens)
+
+            # Clean up connection
+            if connection_id:
+                await connection_manager.remove_connection(connection_id)
+
+            return result
+
+    except Exception as e:
+        # Log error analytics
+        if config.ENABLE_ANALYTICS:
+            await analytics_tracker.log_request(metadata, 0, "error", error=True)
+
+        logger.error(f"Error in autonomous_chat: {str(e)}", exc_info=True)
+
+        # Clean up connection on error
         if connection_id:
             await connection_manager.remove_connection(connection_id)
-            logger.debug(f"Connection tracking ended: {connection_id}")
+
+        # Return error response
+        error_msg = f"Internal server error: {str(e)}"
+        if stream:
+            async def error_stream():
+                yield f"data: {json.dumps({'error': error_msg})}\n\n"
+                yield "data: [DONE]\n\n"
+            return StreamingResponse(error_stream(), media_type="text/event-stream")
+        else:
+            return JSONResponse(status_code=500, content={"error": error_msg})
+
+@app.get("/metrics")
+async def metrics(request: Request):
+    """
+    Expose metrics for monitoring systems (Prometheus/Grafana compatible).
+
+    AUTHORIZATION: Only accessible by Robert P Smith.
+    Use header "X-User-Name: Robert P Smith" or "X-Admin-Token: RobertPSmith-AdminAccess-2025"
+
+    Returns comprehensive metrics from all subsystems:
+    - Session manager statistics
+    - Rate limiter statistics
+    - Analytics data
+    - Connection manager status
+    """
+    # Check authorization
+    if not await check_admin_authorization(request):
+        logger.warning(f"Unauthorized metrics access attempt from {request.client.host if request.client else 'unknown'}")
+        return JSONResponse(status_code=404, content={"detail": "Not found"})
+
+    # Authorized - return metrics
+    metrics_data = {
+        "session_manager": await session_manager.get_stats() if session_manager else {},
+        "rate_limiter": await rate_limiter.get_stats() if rate_limiter else {},
+        "connection_manager": await connection_manager.get_connection_status() if connection_manager else {},
+    }
+
+    if config.ENABLE_ANALYTICS:
+        metrics_data["analytics"] = await analytics_tracker.export_metrics()
+        metrics_data["global_summary"] = await analytics_tracker.get_global_summary()
+
+    return metrics_data
+
+
+@app.get("/sessions/{user_id}")
+async def get_user_sessions(user_id: str, request: Request):
+    """
+    Get session information for a specific user.
+
+    AUTHORIZATION: Only accessible by Robert P Smith.
+    Use header "X-User-Name: Robert P Smith" or "X-Admin-Token: RobertPSmith-AdminAccess-2025"
+
+    Args:
+        user_id: User identifier
+        request: FastAPI Request object for authorization
+
+    Returns:
+        User sessions and rate limit status (or 404 if unauthorized)
+    """
+    # Check authorization
+    if not await check_admin_authorization(request):
+        logger.warning(f"Unauthorized session access attempt for user {user_id[:8]}... from {request.client.host if request.client else 'unknown'}")
+        return JSONResponse(status_code=404, content={"detail": "Not found"})
+
+    # Authorized - return session data
+    sessions = await session_manager.get_user_sessions(user_id)
+    rate_status = await rate_limiter.get_user_status(user_id)
+
+    if config.ENABLE_ANALYTICS:
+        user_summary = await analytics_tracker.get_user_summary(user_id)
+    else:
+        user_summary = {}
+
+    return {
+        "user_id": user_id,
+        "sessions": sessions,
+        "rate_limit_status": rate_status,
+        "analytics": user_summary
+    }
+
 
 @app.get("/health")
 async def health():

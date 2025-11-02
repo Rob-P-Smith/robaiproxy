@@ -80,6 +80,27 @@ class Config:
     MODEL_POLL_INTERVAL: int = int(os.getenv("MODEL_POLL_INTERVAL", "2"))
     ENABLE_INTERNAL_TOOL_CALLING: bool = os.getenv("ENABLE_INTERNAL_TOOL_CALLING", "false").lower() == "true"
 
+    # ========================================================================
+    # User Rate Limiting (metadata-driven)
+    # ========================================================================
+    USER_REQUESTS_PER_MINUTE: int = int(os.getenv("USER_REQUESTS_PER_MINUTE", "1000000"))
+    USER_TOKENS_PER_HOUR: int = int(os.getenv("USER_TOKENS_PER_HOUR", "100000000"))
+    RATE_LIMIT_CLEANUP_INTERVAL: int = int(os.getenv("RATE_LIMIT_CLEANUP_INTERVAL", "300"))
+
+    # ========================================================================
+    # Session Management (metadata-driven)
+    # ========================================================================
+    SESSION_MAX_COUNT: int = int(os.getenv("SESSION_MAX_COUNT", "1000"))
+    SESSION_TIMEOUT_SECONDS: int = int(os.getenv("SESSION_TIMEOUT_SECONDS", "3600"))
+    SESSION_CLEANUP_INTERVAL: int = int(os.getenv("SESSION_CLEANUP_INTERVAL", "600"))
+
+    # ========================================================================
+    # Analytics Configuration
+    # ========================================================================
+    ENABLE_ANALYTICS: bool = os.getenv("ENABLE_ANALYTICS", "true").lower() == "true"
+    ANALYTICS_FLUSH_INTERVAL: int = int(os.getenv("ANALYTICS_FLUSH_INTERVAL", "60"))
+    ANALYTICS_RETENTION_HOURS: int = int(os.getenv("ANALYTICS_RETENTION_HOURS", "24"))
+
     @classmethod
     def validate(cls) -> None:
         """
@@ -125,6 +146,9 @@ class Config:
             print(f"  Max Context:       {cls.MAX_MODEL_CONTEXT:,} tokens")
             print(f"  Reject Limit:      {cls.MAX_REQUEST_TOKENS:,} tokens ({int(cls.CONTEXT_SAFETY_MARGIN*100)}%)")
             print(f"  Warning Threshold: {cls.WARNING_TOKEN_COUNT:,} tokens ({int(cls.TOKEN_WARNING_THRESHOLD*100)}%)")
+        print(f"User Rate Limits:    {cls.USER_REQUESTS_PER_MINUTE} req/min, {cls.USER_TOKENS_PER_HOUR:,} tokens/hr")
+        print(f"Session Management:  Max {cls.SESSION_MAX_COUNT} sessions, {cls.SESSION_TIMEOUT_SECONDS}s timeout")
+        print(f"Analytics:           {'ENABLED' if cls.ENABLE_ANALYTICS else 'DISABLED'}")
         print("=" * 80 + "\n")
 
 

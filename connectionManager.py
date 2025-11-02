@@ -31,39 +31,70 @@ class ConnectionManager:
         # Callback for when connection count changes (0 -> non-zero or non-zero -> 0)
         self._activity_callback = None
     
-    async def add_connection(self, request: Request, endpoint: str) -> str:
+    async def add_connection(self, request: Request, endpoint: str, metadata: dict = None) -> str:
         """
-        Add a new connection to the manager.
-        
+        Add a new connection to the manager with optional metadata support.
+
         Args:
             request: FastAPI Request object
             endpoint: The endpoint path being requested
-            
+            metadata: Optional metadata from robai-webui containing:
+                - message_id: Unique message identifier (used as connection_id)
+                - chat_id: Chat session identifier
+                - user_id: User identifier
+                - variables: User context variables
+
         Returns:
-            str: Unique connection ID for the new connection
+            str: Connection ID (message_id if available, else UUID)
         """
         # Skip tracking for excluded endpoints
         if endpoint in self.excluded_endpoints:
             return ""
-        
-        # Generate unique connection ID
-        connection_id = str(uuid.uuid4())
-        
-        # Create connection info
+
+        # Use message_id as connection ID if available (unique per request)
+        # Otherwise generate UUID for backward compatibility
+        if metadata and metadata.get("message_id"):
+            connection_id = metadata["message_id"]
+            chat_id = metadata.get("chat_id")
+            user_id = metadata.get("user_id")
+            session_id = metadata.get("session_id")
+            user_name = metadata.get("variables", {}).get("{{USER_NAME}}", "Unknown")
+        else:
+            connection_id = str(uuid.uuid4())
+            chat_id = None
+            user_id = None
+            session_id = None
+            user_name = "Unknown"
+
+        # Create connection info with metadata
         connection_info = {
-            "request_id": connection_id,
+            "connection_id": connection_id,
+            "chat_id": chat_id,
+            "user_id": user_id,
+            "session_id": session_id,
+            "user_name": user_name,
             "endpoint": endpoint,
             "method": request.method,
             "client_host": request.client.host if request.client else "unknown",
             "timestamp": asyncio.get_event_loop().time(),
-            "status": "active"
+            "status": "active",
+            "has_metadata": metadata is not None
         }
-        
+
         # Add connection with thread-safe operation
         async with self._lock:
             was_empty = len(self.connections) == 0
             self.connections[connection_id] = connection_info
-            logger.debug(f"Connection added: {connection_id} for {endpoint}")
+
+            # Log with metadata context if available
+            if metadata:
+                logger.debug(
+                    f"Connection added | ID: {connection_id[:8]}... | "
+                    f"Chat: {chat_id[:8] if chat_id else 'none'}... | "
+                    f"User: {user_name}"
+                )
+            else:
+                logger.debug(f"Connection added: {connection_id} for {endpoint} (no metadata)")
 
             # Notify callback if we went from 0 to 1 connections
             if was_empty and self._activity_callback:
@@ -168,10 +199,10 @@ class ConnectionManager:
     async def get_connection_by_endpoint(self, endpoint: str) -> Dict[str, Dict]:
         """
         Get all connections for a specific endpoint.
-        
+
         Args:
             endpoint: Endpoint path to filter by
-            
+
         Returns:
             Dict: Dictionary of connections for the specified endpoint
         """
@@ -180,6 +211,54 @@ class ConnectionManager:
                 conn_id: conn_info for conn_id, conn_info in self.connections.items()
                 if conn_info["endpoint"] == endpoint and conn_info["status"] == "active"
             }
+
+    async def get_connections_by_user(self, user_id: str) -> Dict[str, Dict]:
+        """
+        Get all active connections for a specific user.
+
+        Args:
+            user_id: User identifier
+
+        Returns:
+            Dict: Dictionary of connections for the specified user
+        """
+        async with self._lock:
+            return {
+                conn_id: conn_info for conn_id, conn_info in self.connections.items()
+                if conn_info.get("user_id") == user_id and conn_info["status"] == "active"
+            }
+
+    async def get_connections_by_chat(self, chat_id: str) -> Dict[str, Dict]:
+        """
+        Get all connections for a specific chat session.
+
+        Args:
+            chat_id: Chat session identifier
+
+        Returns:
+            Dict: Dictionary of connections for the specified chat
+        """
+        async with self._lock:
+            return {
+                conn_id: conn_info for conn_id, conn_info in self.connections.items()
+                if conn_info.get("chat_id") == chat_id and conn_info["status"] == "active"
+            }
+
+    async def count_user_connections(self, user_id: str) -> int:
+        """
+        Count active connections for a user.
+
+        Args:
+            user_id: User identifier
+
+        Returns:
+            int: Number of active connections
+        """
+        async with self._lock:
+            return sum(
+                1 for conn_info in self.connections.values()
+                if conn_info.get("user_id") == user_id and conn_info["status"] == "active"
+            )
     
     async def clear_all_connections(self):
         """

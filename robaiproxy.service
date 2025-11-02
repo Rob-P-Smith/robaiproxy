@@ -1,0 +1,19 @@
+[Unit]
+Description=Research Proxy Agent - FastAPI LLM Research Proxy with Dynamic Model Detection
+After=network.target
+
+[Service]
+Type=simple
+User=robiloo
+WorkingDirectory=/home/robiloo/Documents/robaitools/robaiproxy
+Environment="PATH=/home/robiloo/Documents/robaitools/robaivenv/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+Environment="PYTHONUNBUFFERED=1"
+Environment="PYTHONPATH=/home/robiloo/Documents/robaitools:/home/robiloo/Documents/robaitools/robaivenv/lib/python3.10/site-packages"
+ExecStart=/home/robiloo/Documents/robaitools/robaivenv/bin/uvicorn requestProxy:app --host 0.0.0.0 --port 8079 --log-level info
+Restart=always
+RestartSec=10
+StandardOutput=append:/home/robiloo/Documents/robaitools/robaiproxy/proxy.log
+StandardError=append:/home/robiloo/Documents/robaitools/robaiproxy/proxy.log
+
+[Install]
+WantedBy=multi-user.target
