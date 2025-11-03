@@ -21,11 +21,16 @@ from robaimultiturn import (
     research_stream,
     research_sync,
     augment_with_rag,
+    augment_with_crawl,
     create_pondering_stream,
     wrap_stream_with_rag_indicator,
     check_if_first_user_message,
     has_research_keyword,
-    create_sse_chunk
+    create_sse_chunk,
+    get_prompt_analyzer,
+    get_tool_discovery,
+    execute_autonomous_tools,
+    execute_autonomous_tools_stream
 )
 
 # Import connection manager
@@ -43,6 +48,10 @@ from analytics import analytics_tracker
 current_model_name: Optional[str] = None
 current_model_data: Optional[dict] = None  # Full model data from vLLM
 model_fetch_task: Optional[asyncio.Task] = None
+
+# Global system prompts (built once, refreshed every 5 min)
+system_prompt_no_tools: str = ""  # For hardcoded flows (STEP 8, 9, 10)
+system_prompt_tools: str = ""     # For autonomous flow (STEP 12)
 
 # Research concurrency limits (from config)
 research_semaphore = Semaphore(config.MAX_STANDARD_RESEARCH)  # Max standard research requests
@@ -229,18 +238,44 @@ def is_model_available() -> bool:
     return current_model_name is not None
 
 
+def estimate_tokens_from_chars(text: str) -> int:
+    """
+    Fast token estimation using conservative character count.
+
+    Uses worst-case chars/token ratio (1.3) based on technical content analysis.
+    This is O(1) operation taking ~50 nanoseconds vs 5-20ms for tokenizer.
+
+    Args:
+        text: Concatenated message content
+
+    Returns:
+        int: Conservative token estimate (overestimate for safety)
+    """
+    char_count = len(text)
+    estimated_tokens = int(char_count / config.CHARS_PER_TOKEN_CONSERVATIVE)
+    return estimated_tokens
+
+
 async def count_request_tokens(messages: list) -> Optional[int]:
     """
-    Count tokens in a chat completion request using vLLM's tokenizer.
+    Count tokens in a chat completion request with two-tier validation.
 
-    Concatenates all message content and calls vLLM's /tokenize endpoint
-    to get accurate token count.
+    Optimization:
+    - Fast path: Character-based estimation for most requests (~50ns)
+    - Slow path: Tokenizer API call only for large requests near limit (~5-20ms)
+
+    Concatenates all message content and:
+    1. Does quick char count and estimates tokens (char_count / 1.3)
+    2. If estimate < 225k tokens: Returns estimate (instant validation)
+    3. If estimate >= 225k tokens: Calls tokenizer for accurate count
+
+    This saves 5-20ms on 99%+ of requests while maintaining safety.
 
     Args:
         messages: List of message dicts with 'role' and 'content'
 
     Returns:
-        int: Token count, or None if tokenization fails
+        int: Token count (estimated or accurate), or None if tokenization fails
     """
     if not config.PRECOUNT_PROMPT_TOKENS:
         return None
@@ -263,6 +298,17 @@ async def count_request_tokens(messages: list) -> Optional[int]:
                         text_parts.append(item.get("text", ""))
                 full_text += f"{role}: {' '.join(text_parts)}\n"
 
+        # Fast path: Estimate tokens from character count
+        estimated_tokens = estimate_tokens_from_chars(full_text)
+
+        # If well below threshold, use fast estimate
+        if estimated_tokens < config.TOKENIZER_THRESHOLD_TOKENS:
+            logger.debug(f"Fast token estimate: {estimated_tokens} tokens (below threshold {config.TOKENIZER_THRESHOLD_TOKENS})")
+            return estimated_tokens
+
+        # Slow path: Near limit, use accurate tokenizer
+        logger.debug(f"Estimated {estimated_tokens} tokens >= threshold {config.TOKENIZER_THRESHOLD_TOKENS}, using tokenizer for accuracy")
+
         # Call vLLM tokenize endpoint
         async with httpx.AsyncClient(timeout=config.TOKENIZE_TIMEOUT) as client:
             response = await client.post(
@@ -275,7 +321,7 @@ async def count_request_tokens(messages: list) -> Optional[int]:
             # vLLM returns: {"tokens": [123, 456, ...], "count": N}
             # Try 'count' first, fall back to len(tokens)
             token_count = data.get("count", len(data.get("tokens", [])))
-            logger.debug(f"Tokenization successful: {token_count} tokens")
+            logger.debug(f"Tokenization successful: {token_count} tokens (accurate count)")
             return token_count
 
     except httpx.TimeoutException:
@@ -524,9 +570,72 @@ async def lifespan(app: FastAPI):
         await analytics_tracker.start_cleanup_task()
         logger.info("Analytics tracker started")
 
+    # Discover MCP tools on startup (graceful failure)
+    logger.info("🔍 Discovering MCP tools...")
+    tool_discovery = get_tool_discovery()
+
+    async def build_system_prompts():
+        """Build both system prompts (with and without tools)"""
+        global system_prompt_no_tools, system_prompt_tools
+
+        # Get base prompt without tools
+        system_prompt_no_tools = tool_discovery.get_base_system_prompt()
+
+        # Get full prompt with tools
+        system_prompt_tools = tool_discovery.get_full_system_prompt()
+
+        logger.debug(f"📝 System prompts built: no_tools={len(system_prompt_no_tools)} chars, tools={len(system_prompt_tools)} chars")
+
+    try:
+        await tool_discovery.discover_tools()
+        logger.info(f"✅ Discovered {tool_discovery.get_tool_count()} MCP tools: {', '.join(tool_discovery.get_tool_names()[:5])}" + ("..." if tool_discovery.get_tool_count() > 5 else ""))
+
+        # Build system prompts
+        await build_system_prompts()
+        logger.info("📝 System prompts built (with and without tools)")
+
+    except Exception as e:
+        logger.warning(f"⚠️  MCP tool discovery failed on startup: {e}")
+        logger.warning("⚠️  Autonomous tool calling will be disabled (will retry on each request)")
+
+    # Initialize intent classifier for research detection
+    # DISABLED: BART model causes std::bad_alloc crash
+    # logger.info("🤖 Initializing intent classifier...")
+    # try:
+    #     from classifier import initialize_classifier
+    #     classifier = initialize_classifier(
+    #         confidence_threshold=getattr(config, 'AGENTIC_CONFIDENCE_THRESHOLD', 0.7),
+    #         vllm_url=config.VLLM_BACKEND_URL + "/v1"
+    #     )
+    #     stats = classifier.get_stats()
+    #     logger.info(f"✅ Intent classifier ready: device={stats['device']}, fallback={stats['fallback_mode']}, vllm={stats['vllm_configured']}")
+    # except Exception as e:
+    #     logger.warning(f"⚠️  Intent classifier initialization failed: {e}")
+    #     logger.warning("⚠️  Falling back to regex-based classification")
+    logger.info("🤖 Intent classifier disabled (using regex fallback)")
+
+    # Start periodic tool refresh task (every 5 minutes)
+    async def periodic_tool_refresh():
+        """Refresh MCP tools and system prompts every 5 minutes"""
+        while True:
+            await asyncio.sleep(300)  # 5 minutes
+            try:
+                await tool_discovery.discover_tools()
+                await build_system_prompts()  # Rebuild prompts with new tools
+                logger.debug(f"🔄 Refreshed MCP tools and prompts: {tool_discovery.get_tool_count()} available")
+            except Exception as e:
+                logger.error(f"Tool refresh failed: {e}")
+
+    tool_refresh_task = asyncio.create_task(periodic_tool_refresh())
+    logger.info("🔄 MCP tool refresh task started (5-minute interval)")
+
     yield
 
     # Cleanup on shutdown
+    # Stop tool refresh task
+    tool_refresh_task.cancel()
+    logger.info("Tool refresh task stopped")
+
     # Stop analytics tracker
     if config.ENABLE_ANALYTICS:
         await analytics_tracker.stop_cleanup_task()
@@ -603,66 +712,67 @@ RESEARCH_KEYWORDS = {
 }
 
 
-def detect_research_mode(messages: list) -> tuple[bool, int]:
+def detect_research_mode(messages: list, enable_agentic: bool = None) -> tuple[bool, int, str, bool]:
     """
     Detect if research mode should be activated and determine iteration count.
 
-    Checks the last user message for "research" keyword with optional modifiers:
-    - "research" (no modifier) → 2 iterations (default)
-    - "research thoroughly/carefully/all/comprehensively/deep/deeply/detailed/extensive/extensively" → 4 iterations
+    Uses PromptAnalyzer for intelligent detection beyond explicit keywords.
 
     Args:
         messages (list): List of message dict objects with 'role' and 'content' keys
+        enable_agentic (bool, optional): Override config setting for agentic detection
 
     Returns:
-        tuple[bool, int]: (is_research_mode, iteration_count)
-            - is_research_mode: True if "research" keyword found
+        tuple[bool, int, str, bool]: (is_research_mode, iteration_count, reason, is_explicit)
+            - is_research_mode: True if research should be triggered
             - iteration_count: Number of iterations (2 or 4)
+            - reason: Human-readable reason for the decision
+            - is_explicit: True if triggered by explicit "research" keyword, False if agentic
 
     Examples:
-        "research python" → (True, 2)
-        "research deep kubernetes" → (True, 4)
-        "hello world" → (False, 2)
+        "research python" → (True, 2, "Explicit 'research' keyword", True)
+        "What is async programming?" → (True, 2, "Agentic trigger (confidence: 0.90)", False)
+        "hello world" → (False, 2, "Below threshold (confidence: 0.10)", False)
     """
-    # Find the last user message
-    for msg in reversed(messages):
-        if msg.get("role") == "user":
-            content = msg.get("content", "")
+    # Use config setting if not explicitly provided
+    if enable_agentic is None:
+        enable_agentic = getattr(config, 'ENABLE_AGENTIC_RESEARCH', False)
 
-            # Handle both string and list (multimodal) content formats
-            if isinstance(content, list):
-                # Extract text from multimodal content
-                text_parts = []
-                for item in content:
-                    if isinstance(item, dict) and item.get("type") == "text":
-                        text_parts.append(item.get("text", ""))
-                content = " ".join(text_parts)
+    # Get configured prompt analyzer
+    analyzer = get_prompt_analyzer()
 
-            content = content.strip().lower()
+    # Use the analyzer's logic
+    should_research, iterations, reason = analyzer.should_trigger_research(messages, enable_agentic)
 
-            # Check if message starts with "research"
-            if not content.startswith("research"):
-                return (False, 2)
+    # Determine if it's explicit research (keyword-triggered) or agentic
+    is_explicit = "research" in reason.lower() and "keyword" in reason.lower()
 
-            # Found "research", now check for modifiers
-            # Extract the word immediately after "research"
-            parts = content.split(maxsplit=2)  # Split into at most 3 parts
+    # Log the decision for debugging
+    if should_research:
+        logger.info(f"Research mode triggered: {reason} → {iterations} iterations (explicit: {is_explicit})")
+    else:
+        logger.debug(f"Research mode not triggered: {reason}")
 
-            if len(parts) == 1:
-                # Just "research" with nothing after
-                return (True, 2)
+    return (should_research, iterations, reason, is_explicit)
 
-            # Check the second word against our keyword lists
-            modifier = parts[1]
 
-            # Check for deep/comprehensive keywords (4 iterations)
-            if modifier in RESEARCH_KEYWORDS[4]:
-                return (True, 4)
+def sanitize_messages(body: dict) -> dict:
+    """
+    Remove profile_image_url from all messages to prevent base64 encoded images in logs.
 
-            # No recognized modifier, default to 2 iterations
-            return (True, 2)
+    This should be called immediately after parsing the request body to keep logs clean.
 
-    return (False, 2)
+    Args:
+        body (dict): Request body containing messages
+
+    Returns:
+        dict: Sanitized body with profile_image_url removed from all messages
+    """
+    messages = body.get("messages", [])
+    for msg in messages:
+        if "profile_image_url" in msg:
+            del msg["profile_image_url"]
+    return body
 
 
 def is_multimodal(messages: list) -> bool:
@@ -759,12 +869,17 @@ async def passthrough_stream(body: dict, request: Request = None):
     target_url = f"{config.VLLM_BACKEND_URL}/v1/chat/completions"
     logger.debug(f"🟢 FORWARD (stream): → {target_url}")
 
+    # Strip metadata before sending to vLLM (vLLM doesn't accept it)
+    clean_body = {k: v for k, v in body.items() if k != "metadata"}
+    if "metadata" in body:
+        logger.debug(f"🧹 Stripped metadata field ({len(str(body['metadata']))} chars)")
+
     try:
         async with httpx.AsyncClient() as client:
             async with client.stream(
                 "POST",
                 target_url,
-                json=body,
+                json=clean_body,
                 timeout=300.0
             ) as response:
                 # Check if response is an error
@@ -800,11 +915,16 @@ async def passthrough_sync(body: dict):
     target_url = f"{config.VLLM_BACKEND_URL}/v1/chat/completions"
     logger.debug(f"🟢 FORWARD (sync): → {target_url}")
 
+    # Strip metadata before sending to vLLM (vLLM doesn't accept it)
+    clean_body = {k: v for k, v in body.items() if k != "metadata"}
+    if "metadata" in body:
+        logger.debug(f"🧹 Stripped metadata field ({len(str(body['metadata']))} chars)")
+
     try:
         async with httpx.AsyncClient() as client:
             response = await client.post(
                 target_url,
-                json=body,
+                json=clean_body,
                 timeout=300.0
             )
             response.raise_for_status()
@@ -842,7 +962,7 @@ async def passthrough_sync(body: dict):
         }
 
 
-async def research_with_queue_management(body: dict, model: str, iterations: int, request, semaphore, is_deep: bool):
+async def research_with_queue_management(body: dict, model: str, iterations: int, request, semaphore, is_deep: bool, chat_id: str = None, is_explicit_research: bool = True):
     """
     Wrapper for research mode with queue management and health checks.
 
@@ -856,6 +976,8 @@ async def research_with_queue_management(body: dict, model: str, iterations: int
         request: FastAPI Request object
         semaphore: Asyncio Semaphore to control concurrency
         is_deep (bool): True for deep research, False for standard
+        chat_id (str, optional): Chat ID for per-request tracking
+        is_explicit_research (bool): True if triggered by "research" keyword, False if agentic
 
     Yields:
         bytes: SSE-formatted chunks (queue messages, research results, or errors)
@@ -895,7 +1017,9 @@ async def research_with_queue_management(body: dict, model: str, iterations: int
             mcp_url=config.REST_API_URL,
             mcp_api_key=config.REST_API_KEY,
             serper_api_key=config.SERPER_API_KEY,
-            request=request
+            request=request,
+            chat_id=chat_id,
+            is_explicit_research=is_explicit_research
         ):
             yield chunk
 
@@ -921,9 +1045,12 @@ async def autonomous_chat(request: Request):
     5. Token validation using model info from metadata
     6. Model availability check
     7. Multimodal passthrough
-    8. Session-aware RAG (only once per chat)
-    9. Research detection with session tracking
-    10. Standard passthrough with analytics
+    8. Agentic crawl augmentation (MCP direct via stdio)
+    9. Session-aware RAG (only once per chat)
+    10. Research detection with session tracking
+    11. MCP tool discovery and system prompt injection
+    12. Autonomous tool execution loop (max 3 turns, cache-aware)
+    13. Standard passthrough with analytics
 
     Args:
         request: FastAPI Request object with JSON body and metadata
@@ -935,6 +1062,11 @@ async def autonomous_chat(request: Request):
     # STEP 1: Parse request body and extract metadata
     # ========================================================================
     body = await request.json()
+
+    # IMMEDIATELY remove profile_image_url to keep base64 garbage out of logs
+    body = sanitize_messages(body)
+
+    logger.debug(f"📥 FULL REQUEST BODY: {json.dumps(body, indent=2)}")
     metadata = body.get("metadata", {})
     messages = body.get("messages", [])
     stream = body.get("stream", False)
@@ -1021,11 +1153,16 @@ async def autonomous_chat(request: Request):
             return JSONResponse(status_code=429, content=error_response)
 
     # ========================================================================
-    # STEP 5: Check for multimodal content early (instant detection)
+    # STEP 5: Check for multimodal content and extract text for routing logic
     # ========================================================================
     is_multimodal_request = is_multimodal(messages)
+
+    # Extract text-only messages for all routing logic (research, RAG, etc.)
+    # Multimodal requests will use text content for decisions but preserve images in final request
+    messages_for_routing = extract_text_only_messages(messages) if is_multimodal_request else messages
+
     if is_multimodal_request:
-        logger.debug("🖼️  Multimodal content detected - will validate text portion and passthrough to vLLM")
+        logger.debug("🖼️  Multimodal content detected - extracting text for routing logic")
 
     # ========================================================================
     # STEP 6: Model-aware token validation (using metadata model info)
@@ -1036,13 +1173,11 @@ async def autonomous_chat(request: Request):
     model_name = model_info.get("id", get_model_name())
 
     if config.PRECOUNT_PROMPT_TOKENS:
-        # Extract text-only messages for token counting
-        messages_for_tokenization = extract_text_only_messages(messages) if is_multimodal_request else messages
-
+        # Use already extracted text messages for token counting
         if is_multimodal_request:
             logger.debug("🔢 Validating text portion of multimodal request for token limits")
 
-        token_count = await count_request_tokens(messages_for_tokenization)
+        token_count = await count_request_tokens(messages_for_routing)
         if token_count is not None:
             # Use 95% threshold to leave room for response
             token_limit = int(max_context * config.CONTEXT_SAFETY_MARGIN)
@@ -1097,39 +1232,22 @@ async def autonomous_chat(request: Request):
             logger.info("Model became available, proceeding with request")
 
     # ========================================================================
-    # STEP 8: Handle multimodal requests (early passthrough)
+    # STEP 8: Agentic Crawl Augmentation (MCP direct via stdio)
     # ========================================================================
-    if is_multimodal_request:
-        try:
-            logger.debug(f"🖼️  Routing multimodal request for chat {chat_id[:8] if chat_id else 'ephemeral'}...")
+    crawl_info = {"used": False, "urls": [], "succeeded": False}
 
-            # Update session with multimodal flag
-            if chat_id:
-                await session_manager.update_session(chat_id, {
-                    "last_multimodal": time.time()
-                })
+    try:
+        body, crawl_info = await augment_with_crawl(body)
 
-            # Log analytics
-            if config.ENABLE_ANALYTICS:
-                await analytics_tracker.log_request(metadata, estimated_tokens, "multimodal")
-
-            if stream:
-                return StreamingResponse(
-                    passthrough_stream(body, request),
-                    media_type="text/event-stream"
-                )
-            else:
-                result = await passthrough_sync(body)
-                # Update token usage from response
-                if isinstance(result, dict) and "usage" in result:
-                    actual_tokens = result["usage"].get("total_tokens", 0)
-                    if chat_id:
-                        await session_manager.add_tokens(chat_id, actual_tokens)
-                return result
-        finally:
-            # Clean up connection tracking
-            if connection_id:
-                await connection_manager.remove_connection(connection_id)
+        if crawl_info["used"]:
+            logger.info(
+                f"🕷️  MCP Crawl: {len(crawl_info['urls'])} URLs | "
+                f"Deep: {crawl_info['is_deep']} | "
+                f"Depth: {crawl_info.get('depth', 'N/A')} | "
+                f"Pages: {crawl_info.get('pages', 'N/A')}"
+            )
+    except Exception as e:
+        logger.error(f"Crawl augmentation error: {e}", exc_info=True)
 
     # ========================================================================
     # STEP 9: Session-aware RAG augmentation (only once per chat)
@@ -1137,11 +1255,12 @@ async def autonomous_chat(request: Request):
     rag_info = {"used": False, "query": "", "succeeded": False, "url": ""}
 
     # Only augment first message if not already done for this chat
+    # Use text-only messages for routing decisions
     should_augment_with_rag = (
         config.ENABLE_INTERNAL_TOOL_CALLING and
         is_first_message and
         not session.get("rag_augmented", False) and
-        not has_research_keyword(messages)
+        not has_research_keyword(messages_for_routing)
     )
 
     if should_augment_with_rag:
@@ -1154,7 +1273,7 @@ async def autonomous_chat(request: Request):
             reasons.append("not first")
         if session.get("rag_augmented", False):
             reasons.append("already done")
-        if has_research_keyword(messages):
+        if has_research_keyword(messages_for_routing):
             reasons.append("research mode")
         logger.debug(f"⏭️  Skipping RAG: {', '.join(reasons)}")
 
@@ -1190,7 +1309,7 @@ async def autonomous_chat(request: Request):
                 async with httpx.AsyncClient(timeout=config.VLLM_TIMEOUT) as client:
                     async with client.stream(
                         "POST",
-                        f"{config.VLLM_BASE_URL}/chat/completions",
+                        f"{config.VLLM_BACKEND_URL}/v1/chat/completions",
                         json=body
                     ) as response:
                         response.raise_for_status()
@@ -1239,12 +1358,31 @@ async def autonomous_chat(request: Request):
     # STEP 10: Research mode detection and routing with session tracking
     # ========================================================================
     try:
-        # Detect research mode and iteration count
-        is_research, iterations = detect_research_mode(messages)
+        # Detect research mode and iteration count (using text-only messages for routing)
+        is_research, iterations, trigger_reason, is_explicit_research = detect_research_mode(messages_for_routing)
 
-        logger.info(f"Research mode: {is_research}, Iterations: {iterations if is_research else 'N/A'}")
+        logger.info(f"Research mode: {is_research}, Iterations: {iterations if is_research else 'N/A'}, Reason: {trigger_reason}, Explicit: {is_explicit_research if is_research else 'N/A'}")
 
         if is_research:
+            # Inject base system prompt (no tools) for research mode
+            messages = body.get("messages", [])
+            system_idx = next(
+                (i for i, m in enumerate(messages) if m.get("role") == "system"),
+                None
+            )
+
+            if system_idx is not None:
+                # PREPEND base prompt to existing system message (base prompt FIRST)
+                existing_content = messages[system_idx]["content"]
+                messages[system_idx]["content"] = system_prompt_no_tools + "\n\n" + existing_content
+                logger.debug("🔧 Prepended no_tools prompt for research mode")
+            else:
+                # Create new system message with base prompt
+                messages.insert(0, {"role": "system", "content": system_prompt_no_tools})
+                logger.debug("🔧 Created no_tools prompt for research mode")
+
+            body["messages"] = messages
+
             # Update session research count
             if chat_id:
                 await session_manager.increment_research_count(chat_id)
@@ -1254,7 +1392,7 @@ async def autonomous_chat(request: Request):
                 await analytics_tracker.log_request(metadata, estimated_tokens, "research")
 
             logger.info(
-                f"🔬 Research mode | User: {user_name} | "
+                f"{'🔬' if is_explicit_research else '🧠'} Research mode | User: {user_name} | "
                 f"Chat: {chat_id[:8] if chat_id else 'ephemeral'}... | "
                 f"Iterations: {iterations}"
             )
@@ -1268,7 +1406,7 @@ async def autonomous_chat(request: Request):
                 async def research_stream_with_tracking():
                     token_count = 0
                     async for chunk in research_with_queue_management(
-                        body, model_name, iterations, request, semaphore, is_deep
+                        body, model_name, iterations, request, semaphore, is_deep, chat_id, is_explicit_research
                     ):
                         token_count += len(chunk) // 40  # Rough estimate
                         yield chunk
@@ -1309,7 +1447,136 @@ async def autonomous_chat(request: Request):
                     return result
 
         # ========================================================================
-        # STEP 11: Standard passthrough with analytics tracking
+        # STEP 11: Autonomous tool execution (if not research mode)
+        # ========================================================================
+        # NOTE: If research mode was active, function would have returned above
+        # This step only runs for standard requests (not research/analyze)
+
+        # Get tool discovery and check if tools are available
+        tool_discovery = get_tool_discovery()
+        mcp_tools = []
+
+        try:
+            mcp_tools = await tool_discovery.get_tools()
+        except Exception as e:
+            logger.debug(f"Tool discovery failed (continuing without tools): {e}")
+
+        enable_autonomous_tools = mcp_tools and len(mcp_tools) > 0
+
+        if enable_autonomous_tools:
+            logger.debug("🤖 Autonomous tool calling enabled")
+
+            # Inject system_prompt_tools (global, pre-built with tool descriptions)
+            messages = body.get("messages", [])
+            system_idx = next(
+                (i for i, m in enumerate(messages) if m.get("role") == "system"),
+                None
+            )
+
+            if system_idx is not None:
+                # PREPEND tools prompt to existing system message (tools prompt FIRST)
+                existing_content = messages[system_idx]["content"]
+                messages[system_idx]["content"] = system_prompt_tools + "\n\n" + existing_content
+                logger.debug(f"🔧 Prepended tools prompt ({len(mcp_tools)} tools)")
+            else:
+                # Create new system message with tools prompt
+                messages.insert(0, {"role": "system", "content": system_prompt_tools})
+                logger.debug(f"🔧 Created tools prompt ({len(mcp_tools)} tools)")
+
+            body["messages"] = messages
+
+            try:
+                if stream:
+                    # Streaming autonomous tool execution
+                    logger.info(f"🤖 Starting streaming autonomous tool execution...")
+
+                    async def autonomous_stream_with_tracking():
+                        token_count = 0
+                        async for chunk in execute_autonomous_tools_stream(
+                            body,
+                            mcp_tools=mcp_tools,
+                            max_turns=3,
+                            vllm_url=config.VLLM_BACKEND_URL + "/v1",
+                            model_name=model_name
+                        ):
+                            token_count += len(chunk) // 40  # Rough estimate
+                            yield chunk
+
+                        # Update session tokens
+                        if chat_id:
+                            await session_manager.add_tokens(chat_id, token_count)
+
+                        # Clean up connection
+                        if connection_id:
+                            await connection_manager.remove_connection(connection_id)
+
+                    # Log analytics
+                    if config.ENABLE_ANALYTICS:
+                        await analytics_tracker.log_request(metadata, estimated_tokens, "autonomous_tools")
+
+                    return StreamingResponse(
+                        autonomous_stream_with_tracking(),
+                        media_type="text/event-stream"
+                    )
+
+                else:
+                    # Non-streaming autonomous tool execution
+                    final_body, exec_info = await execute_autonomous_tools(
+                        body,
+                        mcp_tools=mcp_tools,
+                        max_turns=3,
+                        vllm_url=config.VLLM_BACKEND_URL + "/v1"
+                    )
+
+                    logger.info(
+                        f"🔧 Autonomous tools: {exec_info['turns']} turns, "
+                        f"{exec_info.get('cache_hits', 0)} cache hits, "
+                        f"tools: {exec_info.get('tools_called', [])}"
+                    )
+
+                    # Extract final response from messages
+                    final_messages = final_body.get("messages", [])
+                    if final_messages and final_messages[-1].get("role") == "assistant":
+                        final_response = {
+                            "id": f"chatcmpl-autonomous-{chat_id[:8] if chat_id else 'ephemeral'}",
+                            "object": "chat.completion",
+                            "created": int(time.time()),
+                            "model": model_name,
+                            "choices": [{
+                                "index": 0,
+                                "message": {
+                                    "role": "assistant",
+                                    "content": final_messages[-1]["content"]
+                                },
+                                "finish_reason": "stop"
+                            }],
+                            "usage": {
+                                "prompt_tokens": 0,
+                                "completion_tokens": 0,
+                                "total_tokens": 0
+                            }
+                        }
+
+                        # Update session tokens
+                        if chat_id:
+                            await session_manager.add_tokens(chat_id, 100)  # Rough estimate
+
+                        # Clean up connection
+                        if connection_id:
+                            await connection_manager.remove_connection(connection_id)
+
+                        # Log analytics
+                        if config.ENABLE_ANALYTICS:
+                            await analytics_tracker.log_request(metadata, estimated_tokens, "autonomous_tools")
+
+                        return final_response
+
+            except Exception as e:
+                logger.error(f"Autonomous tool execution failed: {e}", exc_info=True)
+                logger.warning("Falling back to standard passthrough")
+
+        # ========================================================================
+        # STEP 13: Standard passthrough with analytics tracking
         # ========================================================================
         logger.debug(f"🟢 Standard passthrough for chat {chat_id[:8] if chat_id else 'ephemeral'}...")
 

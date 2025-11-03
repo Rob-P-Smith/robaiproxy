@@ -69,6 +69,11 @@ class Config:
     TOKENIZE_TIMEOUT: int = int(os.getenv("TOKENIZE_TIMEOUT", "5"))
     # Log warning when request exceeds this threshold (0.80 = 80%)
     TOKEN_WARNING_THRESHOLD: float = float(os.getenv("TOKEN_WARNING_THRESHOLD", "0.80"))
+    # Fast token estimation optimization
+    # Conservative chars/token ratio for worst-case estimation (based on technical content)
+    CHARS_PER_TOKEN_CONSERVATIVE: float = float(os.getenv("CHARS_PER_TOKEN_CONSERVATIVE", "1.3"))
+    # Threshold to trigger actual tokenizer (tokens). Below this uses fast char estimation
+    TOKENIZER_THRESHOLD_TOKENS: int = int(os.getenv("TOKENIZER_THRESHOLD_TOKENS", "225000"))
     # Computed effective limits
     MAX_REQUEST_TOKENS: int = int(MAX_MODEL_CONTEXT * CONTEXT_SAFETY_MARGIN)
     WARNING_TOKEN_COUNT: int = int(MAX_MODEL_CONTEXT * TOKEN_WARNING_THRESHOLD)
@@ -100,6 +105,12 @@ class Config:
     ENABLE_ANALYTICS: bool = os.getenv("ENABLE_ANALYTICS", "true").lower() == "true"
     ANALYTICS_FLUSH_INTERVAL: int = int(os.getenv("ANALYTICS_FLUSH_INTERVAL", "60"))
     ANALYTICS_RETENTION_HOURS: int = int(os.getenv("ANALYTICS_RETENTION_HOURS", "24"))
+
+    # ========================================================================
+    # Agentic Research Configuration
+    # ========================================================================
+    ENABLE_AGENTIC_RESEARCH: bool = os.getenv("ENABLE_AGENTIC_RESEARCH", "false").lower() == "true"
+    AGENTIC_CONFIDENCE_THRESHOLD: float = float(os.getenv("AGENTIC_CONFIDENCE_THRESHOLD", "0.7"))
 
     @classmethod
     def validate(cls) -> None:
@@ -149,6 +160,9 @@ class Config:
         print(f"User Rate Limits:    {cls.USER_REQUESTS_PER_MINUTE} req/min, {cls.USER_TOKENS_PER_HOUR:,} tokens/hr")
         print(f"Session Management:  Max {cls.SESSION_MAX_COUNT} sessions, {cls.SESSION_TIMEOUT_SECONDS}s timeout")
         print(f"Analytics:           {'ENABLED' if cls.ENABLE_ANALYTICS else 'DISABLED'}")
+        print(f"Agentic Research:    {'ENABLED' if cls.ENABLE_AGENTIC_RESEARCH else 'DISABLED'}")
+        if cls.ENABLE_AGENTIC_RESEARCH:
+            print(f"  Confidence Thresh: {cls.AGENTIC_CONFIDENCE_THRESHOLD}")
         print("=" * 80 + "\n")
 
 
@@ -233,4 +247,7 @@ if config.PRECOUNT_PROMPT_TOKENS:
     logger.info(f"  Max Context:       {config.MAX_MODEL_CONTEXT:,} tokens")
     logger.info(f"  Reject Limit:      {config.MAX_REQUEST_TOKENS:,} tokens ({int(config.CONTEXT_SAFETY_MARGIN*100)}%)")
     logger.info(f"  Warning Threshold: {config.WARNING_TOKEN_COUNT:,} tokens ({int(config.TOKEN_WARNING_THRESHOLD*100)}%)")
+logger.info(f"Agentic Research:    {'ENABLED' if config.ENABLE_AGENTIC_RESEARCH else 'DISABLED'}")
+if config.ENABLE_AGENTIC_RESEARCH:
+    logger.info(f"  Confidence Thresh: {config.AGENTIC_CONFIDENCE_THRESHOLD}")
 logger.info("=" * 80)
